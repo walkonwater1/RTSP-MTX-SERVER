@@ -296,48 +296,15 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   }
 
   if (result.llm_response.empty()) {
-    // Use streaming LLM + sentence-level TTS pipelining.
-    // As each sentence completes during LLM generation, TTS synthesis
-    // starts immediately — overlapping TTS with LLM tail generation.
-    std::vector<std::string> audio_paths;
-    std::mutex audio_mutex;
-    int sentence_count = 0;
+    result.llm_response = CallLlmChat(system_prompt, text, history_context, skill_context);
 
-    result.llm_response = CallLlmChatStream(system_prompt, text, history_context,
-        skill_context,
-        [&](const std::string& sentence, int idx) {
-          // Synthesize each sentence immediately as LLM generates it
-          std::string wav_path;
-          if (!session_id.empty()) {
-            wav_path = "/dev/shm/rtsp-server/tts_" + session_id + "_s" +
-                       std::to_string(idx) + "_" +
-                       std::to_string(
-                           std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch()).count()) +
-                       ".wav";
-          } else {
-            wav_path = "/dev/shm/rtsp-server/tts_output_s" + std::to_string(idx) + ".wav";
-          }
-          if (SynthesizeTts(sentence, wav_path, session_id)) {
-            std::lock_guard<std::mutex> lock(audio_mutex);
-            audio_paths.push_back(wav_path);
-            sentence_count++;
-          }
-        });
-
-    // Store per-sentence audio paths for incremental push
-    if (!audio_paths.empty()) {
-      result.sentence_audio_paths = std::move(audio_paths);
-      result.tts_audio_path = result.sentence_audio_paths[0];  // backward compat
-    }
-
-    // Cache the result for future use (only simple queries, non-streaming compatible)
+    // Cache the result for frequent static queries
     if (!sr.hit && history_context.empty() && skill_context.empty() && !result.llm_response.empty()) {
       std::string cache_text = user_id + "|||" + text;
       size_t cache_key = std::hash<std::string>{}(cache_text);
       std::lock_guard<std::mutex> lock(llm_cache_mutex_);
       if (llm_cache_.size() >= kMaxLlmCacheEntries) {
-        llm_cache_.clear();  // simple LRU: clear all when full
+        llm_cache_.clear();
       }
       llm_cache_[cache_key] = result.llm_response;
     }
@@ -902,172 +869,6 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
     LOG_ERROR("[LLM] JSON parse error: {}", e.what());
     return "";
   }
-}
-
-// ---------------------------------------------------------------------------
-// Streaming LLM Chat — sentence-level TTS pipelining
-// ---------------------------------------------------------------------------
-
-// State passed to the curl write callback for SSE parsing
-struct StreamState {
-  std::string acc_text;       // accumulated full response
-  std::string sentence_buf;   // current sentence being built
-  int sentence_idx = 0;       // sentence counter
-  SentenceCallback on_sentence;
-};
-
-static size_t StreamWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-  auto* state = static_cast<StreamState*>(userp);
-  size_t total = size * nmemb;
-  std::string chunk(static_cast<char*>(contents), total);
-
-  // Parse SSE: each line that starts with "data:" contains a JSON object
-  // Format: data: {"token": "text", ...}\n\n
-  std::istringstream stream(chunk);
-  std::string line;
-  while (std::getline(stream, line)) {
-    if (line.empty() || line[0] == '\r') continue;
-    if (line.rfind("data: ", 0) != 0) continue;  // not a data line
-
-    std::string json_str = line.substr(6);  // skip "data: "
-    try {
-      auto j = nlohmann::json::parse(json_str);
-      std::string token = j.value("response", "");
-      if (token.empty()) continue;
-
-      state->acc_text += token;
-      state->sentence_buf += token;
-
-      // Check for sentence boundary: Chinese/English punctuation
-      bool sentence_end = false;
-      for (char c : token) {
-        if (c == 0xE3) continue;  // UTF-8 lead byte, check next
-        // ASCII sentence enders
-        if (c == '.' || c == '!' || c == '?' || c == '\n') { sentence_end = true; break; }
-      }
-      // Check for Chinese sentence-ending punctuation (UTF-8 multi-byte)
-      // 。= E3 80 82, ！= EF BC 81, ？= EF BC 9F
-      if (!sentence_end && token.size() >= 3) {
-        for (size_t i = 0; i + 2 < token.size(); i++) {
-          unsigned char b0 = token[i];
-          unsigned char b1 = token[i+1];
-          unsigned char b2 = token[i+2];
-          if ((b0 == 0xE3 && b1 == 0x80 && b2 == 0x82) ||  // 。
-              (b0 == 0xEF && b1 == 0xBC && (b2 == 0x81 || b2 == 0x9F))) {  // ！？
-            sentence_end = true;
-            break;
-          }
-        }
-      }
-
-      if (sentence_end && !state->sentence_buf.empty()) {
-        // Trim whitespace
-        auto start = state->sentence_buf.find_first_not_of(" \t\n\r");
-        auto end = state->sentence_buf.find_last_not_of(" \t\n\r");
-        std::string sentence;
-        if (start != std::string::npos) {
-          sentence = state->sentence_buf.substr(start, end - start + 1);
-        }
-        if (!sentence.empty() && state->on_sentence) {
-          state->on_sentence(sentence, state->sentence_idx++);
-        }
-        state->sentence_buf.clear();
-      }
-    } catch (...) {
-      // Non-JSON line (e.g., "[DONE]") — ignore
-    }
-  }
-  return total;
-}
-
-std::string PipelineBridge::CallLlmChatStream(
-    const std::string& system_prompt,
-    const std::string& user_text,
-    const std::string& history_context,
-    const std::string& skill_context,
-    SentenceCallback on_sentence) {
-
-  CURL* curl = curl_easy_init();
-  if (!curl) return "";
-
-  std::string url = cfg_.llm_host + "/api/chat";
-
-  // Build messages (same as CallLlmChat)
-  json messages = json::array();
-  messages.push_back({{"role", "system"}, {"content", system_prompt}});
-
-  if (!skill_context.empty()) {
-    messages.push_back({{"role", "system"},
-        {"content", "[工具返回结果]\n" + skill_context + "\n\n请严格根据以上工具返回的事实信息回答用户问题。"}});
-  }
-  if (!history_context.empty()) {
-    messages.push_back({{"role", "user"},
-        {"content", "(以下为历史对话记录)\n" + history_context + "\n请基于以上历史对话继续回复。"}});
-  }
-  messages.push_back({{"role", "user"}, {"content", user_text}});
-
-  json body;
-  body["model"] = cfg_.llm_model;
-  body["messages"] = messages;
-  body["stream"] = true;  // enable streaming
-  body["options"]["temperature"] = 0.7;
-  body["options"]["num_predict"] = 128;
-  body["keep_alive"] = -1;
-
-  std::string body_str = body.dump();
-
-  struct curl_slist* headers = nullptr;
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-
-  StreamState state;
-  state.on_sentence = std::move(on_sentence);
-
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
-
-  CURLcode res = curl_easy_perform(curl);
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (res != CURLE_OK) {
-    LOG_ERROR("[LLM-Stream] curl error: {}", curl_easy_strerror(res));
-    return "";
-  }
-
-  // Flush remaining sentence buffer (last sentence may not end with punctuation)
-  if (!state.sentence_buf.empty()) {
-    auto start = state.sentence_buf.find_first_not_of(" \t\n\r");
-    auto end = state.sentence_buf.find_last_not_of(" \t\n\r");
-    std::string last_sentence;
-    if (start != std::string::npos) {
-      last_sentence = state.sentence_buf.substr(start, end - start + 1);
-    }
-    if (!last_sentence.empty() && state.on_sentence) {
-      state.on_sentence(last_sentence, state.sentence_idx++);
-    }
-  }
-
-  // Fallback: if no sentence callback was triggered (short response, no punctuation),
-  // treat the entire response as one sentence.
-  if (state.sentence_idx == 0 && !state.acc_text.empty() && state.on_sentence) {
-    auto start = state.acc_text.find_first_not_of(" \t\n\r");
-    auto end = state.acc_text.find_last_not_of(" \t\n\r");
-    if (start != std::string::npos) {
-      state.on_sentence(state.acc_text.substr(start, end - start + 1), 0);
-    }
-  }
-
-  // Trim final text
-  auto start = state.acc_text.find_first_not_of(" \t\n\r");
-  auto end = state.acc_text.find_last_not_of(" \t\n\r");
-  if (start != std::string::npos) {
-    return state.acc_text.substr(start, end - start + 1);
-  }
-  return state.acc_text;
 }
 
 // ---------------------------------------------------------------------------

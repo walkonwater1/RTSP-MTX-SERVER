@@ -497,11 +497,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                                      session_id, item.tts_id);
                           }
 
-                          // Wait for robot to start pulling, then feed audio incrementally.
-                          // If streaming mode produced per-sentence WAVs, push them
-                          // one by one for lower time-to-first-audio latency.
+                          // Wait for robot to start pulling, then feed audio
                           if (push) {
-                            // Wait for pull_ready once (before first audio chunk)
+                            // Wait for pull_ready
                             {
                               std::unique_lock<std::mutex> pr_lock(s->pull_ready_mutex);
                               if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(2500),
@@ -511,29 +509,20 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               s->pull_ready = false;
                             }
 
-                            const auto& audio_files = result.sentence_audio_paths.empty()
-                                ? std::vector<std::string>{item.audio_path}
-                                : result.sentence_audio_paths;
-
-                            int total_samples = 0;
-                            for (size_t fi = 0; fi < audio_files.size(); fi++) {
-                              std::ifstream wav(audio_files[fi], std::ios::binary);
-                              if (wav) {
-                                wav.seekg(0, std::ios::end);
-                                size_t file_size = wav.tellg();
-                                wav.seekg(44);
-                                size_t data_samples = (file_size - 44) / sizeof(int16_t);
-                                std::vector<int16_t> wav_data(data_samples);
-                                wav.read(reinterpret_cast<char*>(wav_data.data()),
-                                         data_samples * sizeof(int16_t));
-                                g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
-                                total_samples += wav_data.size();
-                                LOG_INFO("[TTS] pushed sentence {}/{} ({} samples) for session {}",
-                                         fi + 1, audio_files.size(), wav_data.size(), session_id);
-                              }
+                            // Read and push WAV data
+                            std::ifstream wav(item.audio_path, std::ios::binary);
+                            if (wav) {
+                              wav.seekg(0, std::ios::end);
+                              size_t file_size = wav.tellg();
+                              wav.seekg(44);
+                              size_t data_samples = (file_size - 44) / sizeof(int16_t);
+                              std::vector<int16_t> wav_data(data_samples);
+                              wav.read(reinterpret_cast<char*>(wav_data.data()),
+                                       data_samples * sizeof(int16_t));
+                              g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
+                              LOG_INFO("[TTS] pushed {} samples for session {}",
+                                       wav_data.size(), session_id);
                             }
-                            LOG_INFO("[TTS] total {} samples across {} sentence(s) for session {}",
-                                     total_samples, audio_files.size(), session_id);
                             g_rtsp_manager->SignalPushEof(push);
                           }
 

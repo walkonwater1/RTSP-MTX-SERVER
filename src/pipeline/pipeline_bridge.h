@@ -31,9 +31,6 @@
 
 namespace rtsp_server {
 
-// Callback for streaming LLM: called on each complete sentence boundary
-using SentenceCallback = std::function<void(const std::string& sentence, int index)>;
-
 // --- Pipeline configuration ---
 struct PipelineBridgeConfig {
   // ASR
@@ -82,8 +79,7 @@ struct PipelineBridgeConfig {
 struct PipelineResult {
   std::string asr_text;      // recognized text
   std::string llm_response;  // LLM reply
-  std::string tts_audio_path; // path to generated WAV file (single)
-  std::vector<std::string> sentence_audio_paths; // per-sentence WAV files (streaming mode)
+  std::string tts_audio_path; // path to generated WAV file
   std::string error;          // non-empty on failure
   bool ok = false;
   bool skill_direct = false;  // skill result, bypassed LLM
@@ -196,11 +192,6 @@ private:
                           const std::string& user_text,
                           const std::string& history_context,
                           const std::string& skill_context = "");
-  std::string CallLlmChatStream(const std::string& system_prompt,
-                                 const std::string& user_text,
-                                 const std::string& history_context,
-                                 const std::string& skill_context,
-                                 SentenceCallback on_sentence);
   std::string EscapeJson(const std::string& s);
 
   // Cached TTS backend check (avoid forking shell every TTS call)
