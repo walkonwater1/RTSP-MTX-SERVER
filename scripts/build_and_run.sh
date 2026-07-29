@@ -141,8 +141,8 @@ build_server() {
   cmake .. "${cmake_args[@]}" 2>&1 | sed 's/^/  [cmake] /'
   cmake --build . -j"$(nproc)" 2>&1 | sed 's/^/  [make]  /'
 
-  if [[ -x "$BUILD_DIR/rtsp_server" ]]; then
-    ok "RTSP server built: $BUILD_DIR/rtsp_server"
+  if [[ -x "$BUILD_DIR/rtsp-mtx-server" ]]; then
+    ok "RTSP server built: $BUILD_DIR/rtsp-mtx-server"
   else
     err "Build failed — binary not found"
     exit 1
@@ -151,8 +151,8 @@ build_server() {
 
 # --- Run server ---
 run_server() {
-  if [[ ! -x "$BUILD_DIR/rtsp_server" ]]; then
-    err "Binary not found at $BUILD_DIR/rtsp_server"
+  if [[ ! -x "$BUILD_DIR/rtsp-mtx-server" ]]; then
+    err "Binary not found at $BUILD_DIR/rtsp-mtx-server"
     err "Run without --run-only to build first."
     exit 1
   fi
@@ -170,11 +170,11 @@ run_server() {
   log "  Config:      $CONFIG_FILE"
   log "  WebSocket:   ws://0.0.0.0:$(grep -oP '"ws_port"\s*:\s*\K\d+' "$CONFIG_FILE" 2>/dev/null || echo 8090)/ws/rtsp"
   log "  RTSP base:   $(grep -oP '"rtsp_base_url"\s*:\s*"\K[^"]+' "$CONFIG_FILE" 2>/dev/null || echo rtsp://0.0.0.0:8554)"
-  log "  Log file:    $PROJECT_DIR/rtsp_server.log"
+  log "  Log file:    $PROJECT_DIR/rtsp-mtx-server.log"
   echo   ""
 
   cd "$PROJECT_DIR"
-  exec "$BUILD_DIR/rtsp_server" "$CONFIG_FILE" "${PASS_THROUGH_ARGS[@]}"
+  exec "$BUILD_DIR/rtsp-mtx-server" "$CONFIG_FILE" "${PASS_THROUGH_ARGS[@]}"
 }
 
 # ============================================================================
@@ -199,7 +199,7 @@ case "$ACTION" in
   build)
     build_pipeline
     build_server
-    ok "Build complete. Binary: $BUILD_DIR/rtsp_server"
+    ok "Build complete. Binary: $BUILD_DIR/rtsp-mtx-server"
     ;;
   run)
     run_server
