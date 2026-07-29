@@ -1,0 +1,61 @@
+{
+  "server": {
+    "ws_port": 8090,
+    "ws_path": "/ws/rtsp",
+    "rtsp_port": 8554,
+    "rtsp_base_url": "rtsp://0.0.0.0:8554",
+    "bind_address": "0.0.0.0",
+    "max_sessions": 32,
+    "heartbeat_interval_sec": 15,
+    "session_timeout_sec": 300
+  },
+  "mediamtx": {
+    "binary_path": "mediamtx",
+    "config_path": "",
+    "auto_launch": true,
+    "rtmp_disable": true,
+    "hls_disable": true,
+    "webrtc_disable": true,
+    "srt_disable": true
+  },
+  "asr": {
+    "model_path": "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/zipformer-ctc-zh",
+    "model_type": "zipformer_ctc",
+    "sample_rate": 16000
+  },
+  "llm": {
+    "host": "http://localhost:11434",
+    "model": "qwen2.5:3b",
+    "system_prompt": "你是小千，一个18岁女大学生，性格活泼开朗，像朋友聊天一样自然。回复控制在2-3句话，约50字。不要复读用户原话，直接回应问题本身。",
+    "timeout_sec": 30,
+    "max_response_tokens": 256
+  },
+  "tts": {
+    "backend": "piper",
+    "rate": 200,
+    "voice": "cmn+f3",
+    "piper_model": "~/pretrained_models/piper/zh_CN/zh_CN-huayan-medium.onnx",
+    "output_sample_rate": 16000,
+    "cache_tts": true,
+    "cache_dir": "/tmp/rtsp-server/tts-cache"
+  },
+  "vad": {
+    "backend": "adaptive",
+    "energy_threshold": 0.008,
+    "min_speech_frames": 15,
+    "min_silence_frames": 15,
+    "pre_speech_frames": 15,
+    "adaptive_factor": 7.0,
+    "min_energy": 0.025,
+    "cooldown_frames": 25,
+    "max_speech_sec": 60,
+    "min_speech_sec": 0.5
+  },
+  "audio": {
+    "push_format": "s16le",
+    "push_sample_rate": 16000,
+    "push_channels": 1,
+    "pull_format": "wav",
+    "debug_dump_dir": "/tmp/rtsp-server/debug"
+  }
+}

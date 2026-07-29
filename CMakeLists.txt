@@ -1,0 +1,79 @@
+cmake_minimum_required(VERSION 3.16)
+project(rtsp-server LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# --- Dependencies ---
+find_package(nlohmann_json REQUIRED)
+find_package(spdlog REQUIRED)
+find_package(CURL REQUIRED)
+
+# --- ASR-LLM-TTS pipeline (optional, link if available) ---
+set(PIPELINE_DIR "/eir/lixin/ASR-LLM-TTS" CACHE PATH "Path to ASR-LLM-TTS project")
+set(PIPELINE_SRC_DIR "${PIPELINE_DIR}/src")
+
+# --- Source files ---
+set(SERVER_SOURCES
+    src/main.cpp
+    src/server/ws_server.cpp
+    src/server/session_manager.cpp
+    src/server/rtsp_manager.cpp
+    src/pipeline/pipeline_bridge.cpp
+)
+
+set(SERVER_HEADERS
+    src/server/ws_server.h
+    src/server/session_manager.h
+    src/server/rtsp_manager.h
+    src/pipeline/pipeline_bridge.h
+    src/utils/base64.h
+    src/utils/logger.h
+)
+
+# --- Executable ---
+add_executable(rtsp_server ${SERVER_SOURCES} ${SERVER_HEADERS})
+
+target_include_directories(rtsp_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${PIPELINE_SRC_DIR}
+    ${PIPELINE_SRC_DIR}/third_party/sherpa-onnx/include
+)
+
+target_link_libraries(rtsp_server PRIVATE
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+    CURL::libcurl
+    pthread
+)
+
+# Optionally link against the ASR-LLM-TTS pipeline library if built
+if(EXISTS "${PIPELINE_DIR}/build/libvoice_pipeline.a")
+    target_link_libraries(rtsp_server PRIVATE
+        "${PIPELINE_DIR}/build/libvoice_pipeline.a"
+        "${PIPELINE_DIR}/build/libspeech.a"
+        "${PIPELINE_DIR}/build/libbrain.a"
+        "${PIPELINE_DIR}/build/libllm.a"
+        "${PIPELINE_DIR}/build/libaudio.a"
+        "${PIPELINE_DIR}/build/libmemory.a"
+    )
+    target_compile_definitions(rtsp_server PRIVATE HAS_VOICE_PIPELINE=1)
+    message(STATUS "Linking against ASR-LLM-TTS pipeline libraries")
+else()
+    message(STATUS "ASR-LLM-TTS pipeline not built — using stub (text-only mode)")
+endif()
+
+# --- Tests ---
+option(BUILD_TESTS "Build tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_executable(test_ws_protocol tests/test_ws_protocol.cpp src/server/ws_server.cpp)
+    target_include_directories(test_ws_protocol PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_ws_protocol PRIVATE nlohmann_json::nlohmann_json spdlog::spdlog pthread)
+    add_test(NAME ws_protocol COMMAND test_ws_protocol)
+endif()
+
+# --- Install ---
+install(TARGETS rtsp_server DESTINATION bin)
+install(FILES config.json DESTINATION etc/rtsp-server/)
