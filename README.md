@@ -117,13 +117,13 @@ cmake --build . -j$(nproc)
 
 ```bash
 # 使用配置文件
-./build/rtsp_server config.json
+./build/rtsp-mtx-server config.json
 
 # 指定端口
-./build/rtsp_server config.json --port-ws 8090 --port-rtsp 8554
+./build/rtsp-mtx-server config.json --port-ws 8090 --port-rtsp 8554
 
 # 使用外部 MediaMTX (不自动启动)
-./build/rtsp_server config.json --no-mediamtx
+./build/rtsp-mtx-server config.json --no-mediamtx
 ```
 
 ## 配置

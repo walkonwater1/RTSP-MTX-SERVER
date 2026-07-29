@@ -67,15 +67,15 @@ set(SERVER_HEADERS
 )
 
 # --- Executable ---
-add_executable(rtsp_server ${SERVER_SOURCES} ${SERVER_HEADERS})
+add_executable(rtsp-mtx-server ${SERVER_SOURCES} ${SERVER_HEADERS})
 
-target_include_directories(rtsp_server PRIVATE
+target_include_directories(rtsp-mtx-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${PIPELINE_SRC_DIR}
     ${PIPELINE_SRC_DIR}/third_party/sherpa-onnx/include
 )
 
-target_link_libraries(rtsp_server PRIVATE
+target_link_libraries(rtsp-mtx-server PRIVATE
     nlohmann_json::nlohmann_json
     spdlog::spdlog
     CURL::libcurl
@@ -84,7 +84,7 @@ target_link_libraries(rtsp_server PRIVATE
 
 # Optionally link against the ASR-LLM-TTS pipeline library if built
 if(EXISTS "${PIPELINE_DIR}/build/libvoice_pipeline.a")
-    target_link_libraries(rtsp_server PRIVATE
+    target_link_libraries(rtsp-mtx-server PRIVATE
         "${PIPELINE_DIR}/build/libvoice_pipeline.a"
         "${PIPELINE_DIR}/build/libspeech.a"
         "${PIPELINE_DIR}/build/libbrain.a"
@@ -92,7 +92,7 @@ if(EXISTS "${PIPELINE_DIR}/build/libvoice_pipeline.a")
         "${PIPELINE_DIR}/build/libaudio.a"
         "${PIPELINE_DIR}/build/libmemory.a"
     )
-    target_compile_definitions(rtsp_server PRIVATE HAS_VOICE_PIPELINE=1)
+    target_compile_definitions(rtsp-mtx-server PRIVATE HAS_VOICE_PIPELINE=1)
     message(STATUS "Linking against ASR-LLM-TTS pipeline libraries")
 else()
     message(STATUS "ASR-LLM-TTS pipeline not built — using stub (text-only mode)")
@@ -109,5 +109,5 @@ if(BUILD_TESTS)
 endif()
 
 # --- Install ---
-install(TARGETS rtsp_server DESTINATION bin)
+install(TARGETS rtsp-mtx-server DESTINATION bin)
 install(FILES config.json DESTINATION etc/rtsp-server/)
