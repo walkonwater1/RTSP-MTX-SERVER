@@ -97,7 +97,24 @@ Skill* SkillManager::find_skill(const std::string& name)
 
 SkillResult SkillManager::detect_and_execute(const std::string& user_text)
 {
-    // ── Strategy 1: Function Calling (LLM-driven) ────────
+    // ── Strategy 1: Keyword Match (fast, <1ms) ─────────────
+    // Run keyword match first — it's instant and covers most daily queries.
+    // FC LLM is only used as fallback for ambiguous queries without clear keywords.
+    for (auto& s : skills_) {
+        if (!s->enabled()) continue;
+
+        if (s->match(user_text)) {
+            std::string result = s->execute(user_text);
+            if (!result.empty()) {
+                LOG_INFO("[Skill-KW] \"{}\" → keyword match {}", user_text, s->name());
+                return {true, s->is_direct_response(), s->name(), result};
+            }
+        }
+    }
+
+    // ── Strategy 2: Function Calling (LLM-driven, fallback) ─
+    // Only call FC LLM if no keyword matched. This avoids the ~400ms FC overhead
+    // for common queries like "你好", "几点了", "天气怎么样", etc.
     if (function_caller_ && fc_enabled_) {
         auto func_defs = collect_function_defs();
         if (!func_defs.empty()) {
@@ -112,22 +129,9 @@ SkillResult SkillManager::detect_and_execute(const std::string& user_text)
                         return {true, skill->is_direct_response(), td.tool_name, result};
                     }
                 } else {
-                    LOG_INFO("[Skill-FC] LLM selected unknown tool: {}, falling back to keyword match",
+                    LOG_INFO("[Skill-FC] LLM selected unknown tool: {}, ignoring",
                              td.tool_name);
                 }
-            }
-        }
-    }
-
-    // ── Strategy 2: Keyword Match (fallback) ─────────────
-    for (auto& s : skills_) {
-        if (!s->enabled()) continue;
-
-        if (s->match(user_text)) {
-            std::string result = s->execute(user_text);
-            if (!result.empty()) {
-                LOG_INFO("[Skill-KW] \"{}\" → keyword match {}", user_text, s->name());
-                return {true, s->is_direct_response(), s->name(), result};
             }
         }
     }

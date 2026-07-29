@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -83,6 +84,11 @@ struct Session {
   std::string current_tts_id;  // currently playing (or awaiting playback)
   int tts_seq = 0;             // auto-increment for tts_id generation
 
+  // TTS push synchronization (replaces 2500ms hardcoded sleep)
+  std::mutex pull_ready_mutex;
+  std::condition_variable pull_ready_cv;
+  bool pull_ready = false;  // robot confirmed pull stream connection
+
   // ASR accumulation
   std::mutex asr_mutex;
   std::string asr_buffer;          // accumulated raw PCM audio
@@ -90,6 +96,7 @@ struct Session {
   bool llm_triggered = false;     // dedup: only one LLM call per wakeup session
   bool speech_detected = false;   // set when actual speech energy is detected
   int64_t last_asr_finalized_ms = 0;  // cooldown: prevent rapid re-trigger
+  bool first_utterance = true;    // skip cooldown for first speech after wake/idle
 
   // WebSocket connection fd (for sending messages directly)
   int ws_fd = -1;

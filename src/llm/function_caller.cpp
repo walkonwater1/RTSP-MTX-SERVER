@@ -75,6 +75,7 @@ ToolDecision FunctionCaller::decide(const std::string& user_message,
     body["messages"] = messages;
     body["stream"] = false;
     body["options"] = {{"temperature", 0.0}};  // 低温 → 更稳定
+    body["keep_alive"] = -1;  // keep model loaded
 
     // 3. 发送请求
     std::string response;

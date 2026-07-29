@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -175,6 +176,15 @@ private:
                           const std::string& history_context,
                           const std::string& skill_context = "");
   std::string EscapeJson(const std::string& s);
+
+  // Cached TTS backend check (avoid forking shell every TTS call)
+  bool piper_available_ = false;
+
+  // LLM response cache: hash(user_text) → response
+  // Avoids redundant LLM calls for frequent queries like "你好", "你叫什么"
+  std::mutex llm_cache_mutex_;
+  std::unordered_map<size_t, std::string> llm_cache_;
+  static constexpr int kMaxLlmCacheEntries = 64;
 
   // Cache
   std::string GetCachePath(const std::string& text);

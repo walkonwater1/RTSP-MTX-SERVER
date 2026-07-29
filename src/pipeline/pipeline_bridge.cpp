@@ -102,6 +102,10 @@ bool PipelineBridge::Initialize() {
     system(cmd.str().c_str());
   }
 
+  // Cache piper availability (avoid forking shell every TTS call)
+  piper_available_ = (system("which piper >/dev/null 2>&1") == 0);
+  LOG_INFO("[Pipeline] piper available: {}", piper_available_);
+
   // Create debug dump dir
   system("mkdir -p /tmp/rtsp-server/debug");
 
@@ -142,7 +146,7 @@ bool PipelineBridge::Initialize() {
   LOG_INFO("[Pipeline] stub mode (LLM + Skills via Ollama HTTP API)");
 #endif
 
-  // Test LLM connectivity
+  // Test LLM connectivity & warm up model (preload into GPU memory)
   {
     std::string test_result = CallLlm("ping");
     if (test_result.empty() || test_result.find("error") != std::string::npos) {
@@ -150,6 +154,14 @@ bool PipelineBridge::Initialize() {
     } else {
       LOG_INFO("[Pipeline] LLM connectivity OK");
     }
+
+    // Warm-up: send a tiny inference to load model into GPU memory.
+    // Without this, the first real query pays a 1.6s+ cold-start penalty.
+    auto t_warm = std::chrono::steady_clock::now();
+    std::string warm_result = CallLlm("hi");
+    auto t_warm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_warm).count();
+    LOG_INFO("[Pipeline] model warm-up complete ({}ms)", t_warm_ms);
   }
 
   ready_.store(true);
@@ -245,7 +257,34 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
     skill_context = sr.result_text;
   }
 
-  result.llm_response = CallLlmChat(system_prompt, text, history_context, skill_context);
+  // LLM response cache: skip LLM call for frequent static queries ("你好", etc.)
+  // Only cache non-skill, non-history queries where the response is deterministic.
+  if (!sr.hit && history_context.empty() && skill_context.empty()) {
+    size_t cache_key = std::hash<std::string>{}(text);
+    {
+      std::lock_guard<std::mutex> lock(llm_cache_mutex_);
+      auto it = llm_cache_.find(cache_key);
+      if (it != llm_cache_.end()) {
+        result.llm_response = it->second;
+        LOG_INFO("[Pipeline] LLM cache hit: \"{}\"", text);
+        // Fall through to TTS (skip LLM call below)
+      }
+    }
+  }
+
+  if (result.llm_response.empty()) {
+    result.llm_response = CallLlmChat(system_prompt, text, history_context, skill_context);
+
+    // Cache the result for future use (only simple queries)
+    if (!sr.hit && history_context.empty() && skill_context.empty() && !result.llm_response.empty()) {
+      size_t cache_key = std::hash<std::string>{}(text);
+      std::lock_guard<std::mutex> lock(llm_cache_mutex_);
+      if (llm_cache_.size() >= kMaxLlmCacheEntries) {
+        llm_cache_.clear();  // simple LRU: clear all when full
+      }
+      llm_cache_[cache_key] = result.llm_response;
+    }
+  }
   auto t_llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t_llm_start).count();
 
@@ -522,13 +561,14 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
   // Check cache
   if (cfg_.tts_cache_enabled) {
     std::string cached = GetCachePath(text);
-    std::ifstream check(cached);
+    std::ifstream check(cached, std::ios::binary);
     if (check.good()) {
       check.close();
-      // Copy from cache
-      std::ostringstream cmd;
-      cmd << "cp " << cached << " " << output_path;
-      if (system(cmd.str().c_str()) == 0) {
+      // Copy from cache via file streams (avoids shell fork)
+      std::ifstream src(cached, std::ios::binary);
+      std::ofstream dst(output_path, std::ios::binary);
+      if (src && dst) {
+        dst << src.rdbuf();
         LOG_INFO("[TTS] cache hit: \"{}\"", text);
         return true;
       }
@@ -547,9 +587,7 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
 #else
   // Stub mode: use external Piper or espeak-ng depending on config
   if (cfg_.tts_backend == "piper" && !cfg_.tts_piper_model.empty()) {
-    // Check if piper binary is available
-    bool have_piper = (system("which piper >/dev/null 2>&1") == 0);
-    if (have_piper) {
+    if (piper_available_) {
       // Piper model sample rate (huayan = 22050)
       // Pipe through ffmpeg to resample to 16kHz for robot compatibility.
       cmd << "echo " << std::quoted(text) << " | "
@@ -561,7 +599,6 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
           << " 2>/dev/null";
     } else {
       LOG_WARN("[TTS] piper requested but not installed, falling back to espeak-ng");
-      have_piper = false;
     }
   }
 
@@ -618,9 +655,11 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
   // Cache the result
   if (cfg_.tts_cache_enabled) {
     std::string cached = GetCachePath(text);
-    std::ostringstream cp_cmd;
-    cp_cmd << "cp " << output_path << " " << cached;
-    system(cp_cmd.str().c_str());
+    std::ifstream src(output_path, std::ios::binary);
+    std::ofstream dst(cached, std::ios::binary);
+    if (src && dst) {
+      dst << src.rdbuf();
+    }
   }
 
   LOG_INFO("[TTS] synthesized: \"{}\" → {}", text, output_path);
@@ -665,6 +704,7 @@ std::string PipelineBridge::CallLlm(const std::string& prompt,
   body["stream"] = false;
   body["options"]["temperature"] = 0.7;
   body["options"]["num_predict"] = 256;
+  body["keep_alive"] = -1;  // keep model loaded in Ollama memory
 
   std::string body_str = body.dump();
 
@@ -756,6 +796,7 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
   body["stream"] = false;
   body["options"]["temperature"] = 0.7;
   body["options"]["num_predict"] = 256;
+  body["keep_alive"] = -1;  // keep model loaded in Ollama memory
 
   std::string body_str = body.dump();
 

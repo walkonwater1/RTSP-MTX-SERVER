@@ -302,6 +302,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count());
       session->llm_triggered = false;  // reset for new wakeup
+      session->first_utterance = true;  // first speech after wake skips cooldown
       session->TransitionTo(SessionState::Streaming);
       session->Touch();
 
@@ -351,7 +352,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               bool has_speech = s->speech_detected;
               bool enough_audio = (current_samples > 16000 * 1);  // at least 1s total
               bool cooldown_ok = true;
-              {
+              if (!s->first_utterance) {
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 cooldown_ok = (now_ms - s->last_asr_finalized_ms) > kCooldownMs;
@@ -378,6 +379,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                     s->asr_buffer.clear();
                     s->asr_finalized = false;
                     s->speech_detected = false;  // reset for next utterance
+                    s->first_utterance = false;  // subsequent utterances need cooldown
                     s->last_asr_finalized_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
                   }
@@ -476,11 +478,18 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               while (wav.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
                                 wav_data.push_back(sample);
                               }
-                              // Wait for robot to connect its pull (robot retries may
-                              // take up to ~2s: 300+600+1200ms back-off).
-                              // Meanwhile, ffmpeg -re pushes at real-time (~6.8s)
-                              // so the robot won't miss the stream.
-                              std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+                              // Wait for robot to confirm pull connection.
+                              // Robot sends playback_status(started) or tts_state(is_playing=true)
+                              // as soon as pull is established (typically <100ms).
+                              // Timeout at 2500ms as safety net for edge cases.
+                              {
+                                std::unique_lock<std::mutex> pr_lock(s->pull_ready_mutex);
+                                if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(2500),
+                                    [&s] { return s->pull_ready; })) {
+                                  LOG_WARN("[TTS] timeout waiting for pull_ready, pushing anyway");
+                                }
+                                s->pull_ready = false;  // reset for next utterance
+                              }
                               g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
                               LOG_INFO("[TTS] pushed {} samples to RTSP for session {}",
                                        wav_data.size(), session_id);
@@ -539,6 +548,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       if (status == "completed") {
         // Robot finished playing TTS → resume ASR
         session->llm_triggered = false;  // re-arm for next speech turn
+        session->first_utterance = true;  // first speech after TTS skips cooldown
         session->TransitionTo(SessionState::Streaming);
         session->current_tts_id.clear();
 
@@ -595,6 +605,12 @@ static void HandleWsMessage(int client_fd, const std::string& event,
           session->speech_detected = false;
           session->asr_finalized = false;
         }
+        // Signal pull_ready: robot has confirmed pull stream connection
+        {
+          std::lock_guard<std::mutex> pr_lock(session->pull_ready_mutex);
+          session->pull_ready = true;
+        }
+        session->pull_ready_cv.notify_one();
         session->TransitionTo(SessionState::Playing);
       }
 
@@ -617,9 +633,19 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       LOG_INFO("[MSG] tts_state(is_playing={}, reason={}) from session {}",
                is_playing, reason, session_id);
 
+      if (is_playing) {
+        // Robot confirmed TTS is playing → pull stream is connected
+        {
+          std::lock_guard<std::mutex> pr_lock(session->pull_ready_mutex);
+          session->pull_ready = true;
+        }
+        session->pull_ready_cv.notify_one();
+      }
+
       if (!is_playing && (reason == "ended" || reason == "stop_tts" ||
                           reason == "interrupt" || reason == "client_stop")) {
         session->llm_triggered = false;  // re-arm for next speech turn
+        session->first_utterance = true;  // first speech after TTS skips cooldown
         session->TransitionTo(SessionState::Streaming);
       }
 
