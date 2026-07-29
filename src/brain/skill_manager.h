@@ -51,6 +51,15 @@ public:
     /// Set the memory store pointer (for MemorySkill)
     void set_memory_store(UserMemoryStore* store) { memory_store_ = store; }
 
+    /// Dynamically switch MemorySkill to the given store (multi-user support)
+    void set_current_user_memory(UserMemoryStore* store);
+
+    /// Check if memory was modified in the last detect_and_execute call
+    bool is_memory_dirty() const { return memory_modified_; }
+
+    /// Clear the memory dirty flag
+    void clear_memory_dirty() { memory_modified_ = false; }
+
     /// Set the chat memory pointer (for context injection)
     void set_chat_memory(ChatMemory* cm) { chat_memory_ = cm; }
 
@@ -77,6 +86,9 @@ private:
     // External references (not owned)
     UserMemoryStore* memory_store_ = nullptr;
     ChatMemory* chat_memory_ = nullptr;
+
+    // Dirty tracking for auto-persist
+    bool memory_modified_ = false;
 
     /// Find a skill by name
     Skill* find_skill(const std::string& name);

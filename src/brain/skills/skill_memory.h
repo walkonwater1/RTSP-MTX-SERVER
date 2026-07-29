@@ -30,8 +30,11 @@ public:
 
     FunctionDef get_function_def() const override;
 
+    /// 动态切换记忆存储（多用户支持）
+    void set_memory_store(UserMemoryStore* store) { memory_ = store; }
+
 private:
-    UserMemoryStore* memory_;  // 非拥有，由 VoicePipeline 管理生命周期
+    UserMemoryStore* memory_;  // 非拥有，由 PipelineBridge 管理生命周期
 
     /// 从文本中提取要记住的内容
     /// "记住我喜欢吃川菜" → "用户喜欢吃川菜"

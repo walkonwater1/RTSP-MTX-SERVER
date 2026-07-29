@@ -93,6 +93,19 @@ Skill* SkillManager::find_skill(const std::string& name)
     return nullptr;
 }
 
+void SkillManager::set_current_user_memory(UserMemoryStore* store)
+{
+    for (auto& s : skills_) {
+        if (s->name() == "memory") {
+            auto* mem_skill = dynamic_cast<MemorySkill*>(s.get());
+            if (mem_skill) {
+                mem_skill->set_memory_store(store);
+            }
+            return;
+        }
+    }
+}
+
 // ── Core: hybrid dispatch ────────────────────────────────
 
 SkillResult SkillManager::detect_and_execute(const std::string& user_text)
@@ -107,6 +120,7 @@ SkillResult SkillManager::detect_and_execute(const std::string& user_text)
             std::string result = s->execute(user_text);
             if (!result.empty()) {
                 LOG_INFO("[Skill-KW] \"{}\" → keyword match {}", user_text, s->name());
+                if (s->name() == "memory") memory_modified_ = true;
                 return {true, s->is_direct_response(), s->name(), result};
             }
         }
@@ -126,6 +140,7 @@ SkillResult SkillManager::detect_and_execute(const std::string& user_text)
                     std::string result = skill->execute(user_text, td.arguments);
                     if (!result.empty()) {
                         LOG_INFO("[Skill-FC] \"{}\" → LLM selected {}", user_text, td.tool_name);
+                        if (td.tool_name == "memory") memory_modified_ = true;
                         return {true, skill->is_direct_response(), td.tool_name, result};
                     }
                 } else {

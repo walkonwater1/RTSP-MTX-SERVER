@@ -129,16 +129,12 @@ bool PipelineBridge::Initialize() {
   }
 
   // --- Set up Memory ---
-  skill_mgr_.set_memory_store(&user_memory_);
+  // Add MemorySkill with a placeholder store — the actual per-user store
+  // will be switched dynamically in ProcessText() via set_current_user_memory().
+  skill_mgr_.add_skill(std::make_unique<MemorySkill>(nullptr));
 
-  // Add MemorySkill now that memory store is available
-  skill_mgr_.add_skill(std::make_unique<MemorySkill>(&user_memory_));
-
-  // Load long-term memory from disk
-  if (cfg_.memory_enabled && !cfg_.memory_persist_dir.empty()) {
-    std::string mem_path = cfg_.memory_persist_dir + "/user_memory.json";
-    user_memory_.load_from_file(mem_path);
-  }
+  // Per-user memory loading is now lazy: GetUserMemory() loads from disk
+  // the first time a given user_id is accessed.
 
 #ifdef HAS_VOICE_PIPELINE
   LOG_INFO("[Pipeline] full voice pipeline mode");
@@ -185,11 +181,35 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
   LOG_INFO("[Pipeline] processing text: \"{}\"", text);
 
+  // ── Resolve user_id for per-user isolation ──────────────
+  std::string user_id;
+  if (!session_id.empty()) {
+    auto it = session_user_map_.find(session_id);
+    if (it != session_user_map_.end()) {
+      user_id = it->second;
+    }
+  }
+
   // ── 1. Try Skill System ────────────────────────────────
   auto t_skill_start = std::chrono::steady_clock::now();
   SkillResult sr;  // declared here so accessible for LLM context injection below
   if (cfg_.skills_enabled) {
+    // Switch MemorySkill to the current user's store before detection
+    if (!user_id.empty()) {
+      UserMemoryStore* um = GetUserMemory(user_id);
+      skill_mgr_.set_current_user_memory(um);
+      skill_mgr_.clear_memory_dirty();
+    }
+
     sr = skill_mgr_.detect_and_execute(text);
+
+    // Auto-persist user memory if modified by skill execution
+    if (skill_mgr_.is_memory_dirty() && !user_id.empty() &&
+        cfg_.memory_enabled && !cfg_.memory_persist_dir.empty()) {
+      std::string mem_path = cfg_.memory_persist_dir + "/user_memory_" + user_id + ".json";
+      UserMemoryStore* um = GetUserMemory(user_id);
+      if (um) um->save_to_file(mem_path);
+    }
 
     if (sr.hit) {
       auto t_skill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -230,7 +250,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   // ── 2. Get conversation history ────────────────────────
   std::string history_context;
   if (cfg_.memory_enabled && !session_id.empty()) {
-    ChatMemory* mem = GetSessionMemory(session_id);
+    ChatMemory* mem = GetSessionMemory(session_id, user_id);
     if (mem) {
       history_context = mem->get_context();
     }
@@ -259,8 +279,10 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
   // LLM response cache: skip LLM call for frequent static queries ("你好", etc.)
   // Only cache non-skill, non-history queries where the response is deterministic.
+  // Cache key includes user_id for per-user isolation.
   if (!sr.hit && history_context.empty() && skill_context.empty()) {
-    size_t cache_key = std::hash<std::string>{}(text);
+    std::string cache_text = user_id + "|||" + text;
+    size_t cache_key = std::hash<std::string>{}(cache_text);
     {
       std::lock_guard<std::mutex> lock(llm_cache_mutex_);
       auto it = llm_cache_.find(cache_key);
@@ -277,7 +299,8 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
     // Cache the result for future use (only simple queries)
     if (!sr.hit && history_context.empty() && skill_context.empty() && !result.llm_response.empty()) {
-      size_t cache_key = std::hash<std::string>{}(text);
+      std::string cache_text = user_id + "|||" + text;
+      size_t cache_key = std::hash<std::string>{}(cache_text);
       std::lock_guard<std::mutex> lock(llm_cache_mutex_);
       if (llm_cache_.size() >= kMaxLlmCacheEntries) {
         llm_cache_.clear();  // simple LRU: clear all when full
@@ -298,9 +321,15 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
   // ── 5. Update conversation memory ──────────────────────
   if (cfg_.memory_enabled && !session_id.empty()) {
-    ChatMemory* mem = GetSessionMemory(session_id);
+    ChatMemory* mem = GetSessionMemory(session_id, user_id);
     if (mem) {
       mem->add(text, result.llm_response);
+
+      // Auto-persist by user_id for cross-session recovery
+      if (!user_id.empty() && !cfg_.memory_persist_dir.empty()) {
+        std::string chat_path = cfg_.memory_persist_dir + "/chat_" + user_id + ".json";
+        mem->save_to_file(chat_path);
+      }
     }
   }
 
@@ -390,7 +419,7 @@ PipelineResult PipelineBridge::ProcessAudio(const int16_t* pcm_data,
     f.write(reinterpret_cast<const char*>(pcm_data), data_size);
   }
 
-  result.asr_text = TranscribeAudio(pcm_data, sample_count);
+  result.asr_text = TranscribeAudio(pcm_data, sample_count, session_id);
 
   if (result.asr_text.empty()) {
     result.error = "ASR produced no text";
@@ -413,7 +442,8 @@ PipelineResult PipelineBridge::ProcessAudio(const int16_t* pcm_data,
 // ---------------------------------------------------------------------------
 
 std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
-                                              int sample_count) {
+                                              int sample_count,
+                                              const std::string& session_id) {
   if (sample_count < 8000) {
     LOG_DEBUG("[Pipeline] TranscribeAudio: too few samples ({}), skipping", sample_count);
     return "";
@@ -431,8 +461,10 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
     return "";
   }
 
-  // Write PCM to WAV file
-  std::string wav_path = "/tmp/rtsp-server/asr_latest.wav";
+  // Write PCM to WAV file (per-session to avoid race conditions)
+  std::string wav_path = session_id.empty()
+      ? "/tmp/rtsp-server/asr_latest.wav"
+      : ("/tmp/rtsp-server/asr_" + session_id + ".wav");
   {
     std::ofstream f(wav_path, std::ios::binary);
     if (!f) return "";
@@ -842,7 +874,8 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
 // Session Memory
 // ---------------------------------------------------------------------------
 
-ChatMemory* PipelineBridge::GetSessionMemory(const std::string& session_id) {
+ChatMemory* PipelineBridge::GetSessionMemory(const std::string& session_id,
+                                                 const std::string& user_id) {
   if (session_id.empty()) return nullptr;
 
   std::lock_guard<std::mutex> lock(memory_mutex_);
@@ -854,9 +887,50 @@ ChatMemory* PipelineBridge::GetSessionMemory(const std::string& session_id) {
         session_id,
         ChatMemory(cfg_.memory_max_rounds, cfg_.memory_max_tokens));
 
-    // Try loading from disk
+    // Try loading from disk: prefer user_id-based (cross-session),
+    // fall back to session_id-based (legacy).
     if (!cfg_.memory_persist_dir.empty()) {
-      std::string path = cfg_.memory_persist_dir + "/chat_" + session_id + ".json";
+      bool loaded = false;
+      if (!user_id.empty()) {
+        std::string user_path = cfg_.memory_persist_dir + "/chat_" + user_id + ".json";
+        loaded = inserted_it->second.load_from_file(user_path);
+      }
+      if (!loaded) {
+        std::string session_path = cfg_.memory_persist_dir + "/chat_" + session_id + ".json";
+        inserted_it->second.load_from_file(session_path);
+      }
+    }
+
+    return &inserted_it->second;
+  }
+
+  return &it->second;
+}
+
+// ---------------------------------------------------------------------------
+// Per-User Memory
+// ---------------------------------------------------------------------------
+
+void PipelineBridge::RegisterSessionUser(const std::string& session_id,
+                                          const std::string& user_id) {
+  std::lock_guard<std::mutex> lock(memory_mutex_);
+  session_user_map_[session_id] = user_id;
+  LOG_INFO("[Pipeline] registered session {} → user {}", session_id, user_id);
+}
+
+UserMemoryStore* PipelineBridge::GetUserMemory(const std::string& user_id) {
+  if (user_id.empty()) return nullptr;
+
+  std::lock_guard<std::mutex> lock(memory_mutex_);
+  auto it = user_memories_.find(user_id);
+  if (it == user_memories_.end()) {
+    // Create new per-user memory store
+    auto [inserted_it, ok] = user_memories_.emplace(
+        user_id, UserMemoryStore());
+
+    // Load from per-user persist file
+    if (cfg_.memory_enabled && !cfg_.memory_persist_dir.empty()) {
+      std::string path = cfg_.memory_persist_dir + "/user_memory_" + user_id + ".json";
       inserted_it->second.load_from_file(path);
     }
 

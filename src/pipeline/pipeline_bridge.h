@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -134,7 +135,8 @@ public:
    * @param sample_count number of samples
    * @return recognized text (may be empty)
    */
-  std::string TranscribeAudio(const int16_t* pcm_data, int sample_count);
+  std::string TranscribeAudio(const int16_t* pcm_data, int sample_count,
+                               const std::string& session_id = "");
 
   /**
    * @brief Generate TTS audio from text.
@@ -155,7 +157,21 @@ public:
   /**
    * @brief Get per-session chat memory (for external access).
    */
-  ChatMemory* GetSessionMemory(const std::string& session_id);
+  ChatMemory* GetSessionMemory(const std::string& session_id,
+                                const std::string& user_id = "");
+
+  /**
+   * @brief Register session → user mapping (call on req_stream handshake).
+   *        Enables per-user memory isolation and cross-session chat recovery.
+   */
+  void RegisterSessionUser(const std::string& session_id,
+                           const std::string& user_id);
+
+  /**
+   * @brief Get or create the UserMemoryStore for a given user_id.
+   *        Loads from per-user persist file on first access.
+   */
+  UserMemoryStore* GetUserMemory(const std::string& user_id);
 
 private:
   PipelineBridgeConfig cfg_;
@@ -163,10 +179,11 @@ private:
 
   // Skills & memory
   SkillManager skill_mgr_;
-  UserMemoryStore user_memory_;
   std::shared_ptr<FunctionCaller> function_caller_;
   std::mutex memory_mutex_;
-  std::map<std::string, ChatMemory> session_memories_;  // per-session
+  std::map<std::string, UserMemoryStore> user_memories_;  // per-user
+  std::map<std::string, std::string> session_user_map_;   // session_id → user_id
+  std::map<std::string, ChatMemory> session_memories_;    // per-session
 
   // In stub mode, we use curl to call Ollama directly
   std::string CallLlm(const std::string& prompt,

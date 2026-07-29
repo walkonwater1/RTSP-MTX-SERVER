@@ -258,6 +258,11 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
       session->ws_fd = client_fd;
 
+      // Register session → user mapping for per-user memory isolation
+      if (g_pipeline) {
+        g_pipeline->RegisterSessionUser(session->session_id, user_id);
+      }
+
       // Send stream_address response
       json resp;
       resp["event"] = "stream_address";
@@ -384,7 +389,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                     if (g_pipeline && g_pipeline->IsReady()) {
                       auto* pcm_ptr = reinterpret_cast<const int16_t*>(s->asr_buffer.data());
                       int pcm_count = s->asr_buffer.size() / sizeof(int16_t);
-                      asr_text = g_pipeline->TranscribeAudio(pcm_ptr, pcm_count);
+                      asr_text = g_pipeline->TranscribeAudio(pcm_ptr, pcm_count, session_id);
                     }
                     s->asr_buffer.clear();
                     s->asr_finalized = false;
