@@ -8,7 +8,7 @@
  *
  * The bridge provides:
  *   - ASR: audio PCM → text
- *   - LLM: text → response text
+ *   - LLM: text → response text (with skills, memory, function calling)
  *   - TTS: text → audio file (WAV)
  *
  * All processing is synchronous (blocking). The caller is responsible for
@@ -22,6 +22,10 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "brain/skill_manager.h"
+#include "memory/chat_memory.h"
+#include "memory/user_memory.h"
 
 namespace rtsp_server {
 
@@ -56,6 +60,17 @@ struct PipelineBridgeConfig {
   int vad_cooldown_frames = 25;
   float vad_max_speech_sec = 60.0f;
   float vad_min_speech_sec = 0.5f;
+
+  // Skills
+  bool skills_enabled = true;
+  bool function_calling_enabled = true;
+  std::string fc_model;  // empty = use llm_model
+
+  // Memory
+  bool memory_enabled = true;
+  int memory_max_rounds = 10;
+  int memory_max_tokens = 512;
+  std::string memory_persist_dir = "/tmp/rtsp-server/memory";
 };
 
 // --- Processing result ---
@@ -65,6 +80,7 @@ struct PipelineResult {
   std::string tts_audio_path; // path to generated WAV file
   std::string error;          // non-empty on failure
   bool ok = false;
+  bool skill_direct = false;  // skill result, bypassed LLM
 };
 
 // --- Voice Pipeline Bridge ---
@@ -77,7 +93,7 @@ public:
   PipelineBridge& operator=(const PipelineBridge&) = delete;
 
   /**
-   * @brief Initialize the pipeline (load models).
+   * @brief Initialize the pipeline (load models, set up skills, memory).
    *        Blocks until models are loaded (may download on first run).
    * @return true on success
    */
@@ -89,10 +105,10 @@ public:
   bool IsReady() const { return ready_.load(); }
 
   /**
-   * @brief Process text through LLM → TTS.
+   * @brief Process text through Skill detection → LLM (with memory) → TTS.
    *        Synchronous, blocking call.
    * @param text      user input text
-   * @param session_id optional session context (for caching)
+   * @param session_id optional session context (for caching and per-session memory)
    * @return result with LLM response and TTS audio path
    */
   PipelineResult ProcessText(const std::string& text,
@@ -135,12 +151,29 @@ public:
    */
   void ReloadConfig(const PipelineBridgeConfig& cfg);
 
+  /**
+   * @brief Get per-session chat memory (for external access).
+   */
+  ChatMemory* GetSessionMemory(const std::string& session_id);
+
 private:
   PipelineBridgeConfig cfg_;
   std::atomic<bool> ready_{false};
 
+  // Skills & memory
+  SkillManager skill_mgr_;
+  UserMemoryStore user_memory_;
+  std::shared_ptr<FunctionCaller> function_caller_;
+  std::mutex memory_mutex_;
+  std::map<std::string, ChatMemory> session_memories_;  // per-session
+
   // In stub mode, we use curl to call Ollama directly
-  std::string CallLlm(const std::string& prompt);
+  std::string CallLlm(const std::string& prompt,
+                      const std::string& context = "");
+  std::string CallLlmChat(const std::string& system_prompt,
+                          const std::string& user_text,
+                          const std::string& history_context,
+                          const std::string& skill_context = "");
   std::string EscapeJson(const std::string& s);
 
   // Cache

@@ -21,6 +21,21 @@ set(SERVER_SOURCES
     src/server/session_manager.cpp
     src/server/rtsp_manager.cpp
     src/pipeline/pipeline_bridge.cpp
+    # Skills & memory
+    src/brain/skill_manager.cpp
+    src/brain/skills/skill_weather.cpp
+    src/brain/skills/skill_time.cpp
+    src/brain/skills/skill_calculator.cpp
+    src/brain/skills/skill_entertainment.cpp
+    src/brain/skills/skill_riddle.cpp
+    src/brain/skills/skill_fortune.cpp
+    src/brain/skills/skill_poetry.cpp
+    src/brain/skills/skill_games.cpp
+    src/brain/skills/skill_memory.cpp
+    src/memory/chat_memory.cpp
+    src/memory/user_memory.cpp
+    src/memory/token_counter.cpp
+    src/llm/function_caller.cpp
 )
 
 set(SERVER_HEADERS
@@ -30,6 +45,25 @@ set(SERVER_HEADERS
     src/pipeline/pipeline_bridge.h
     src/utils/base64.h
     src/utils/logger.h
+    src/utils/http_client.h
+    # Skills & memory headers
+    src/brain/skill_base.h
+    src/brain/skill_utils.h
+    src/brain/skill_manager.h
+    src/brain/skills/skill_weather.h
+    src/brain/skills/skill_time.h
+    src/brain/skills/skill_calculator.h
+    src/brain/skills/skill_entertainment.h
+    src/brain/skills/skill_riddle.h
+    src/brain/skills/skill_fortune.h
+    src/brain/skills/skill_poetry.h
+    src/brain/skills/skill_games.h
+    src/brain/skills/skill_memory.h
+    src/memory/chat_memory.h
+    src/memory/user_memory.h
+    src/memory/vector_store.h
+    src/memory/token_counter.h
+    src/llm/function_caller.h
 )
 
 # --- Executable ---

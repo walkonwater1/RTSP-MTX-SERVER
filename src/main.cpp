@@ -202,6 +202,23 @@ static bool LoadConfig(const std::string& path, ServerConfig& cfg) {
       cfg.debug_dump_dir = a.value("debug_dump_dir", cfg.debug_dump_dir);
     }
 
+    // Skills section
+    if (j.contains("skills")) {
+      auto& sk = j["skills"];
+      cfg.pipeline.skills_enabled = sk.value("enabled", cfg.pipeline.skills_enabled);
+      cfg.pipeline.function_calling_enabled = sk.value("function_calling_enabled", cfg.pipeline.function_calling_enabled);
+      cfg.pipeline.fc_model = sk.value("fc_model", cfg.pipeline.fc_model);
+    }
+
+    // Memory section
+    if (j.contains("memory")) {
+      auto& m = j["memory"];
+      cfg.pipeline.memory_enabled = m.value("enabled", cfg.pipeline.memory_enabled);
+      cfg.pipeline.memory_max_rounds = m.value("max_rounds", cfg.pipeline.memory_max_rounds);
+      cfg.pipeline.memory_max_tokens = m.value("max_tokens", cfg.pipeline.memory_max_tokens);
+      cfg.pipeline.memory_persist_dir = m.value("persist_dir", cfg.pipeline.memory_persist_dir);
+    }
+
     LOG_INFO("Config loaded from {}", path);
     return true;
   } catch (const json::exception& e) {
@@ -390,9 +407,18 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       g_ws_server->SendMessage(s->ws_fd, asr_msg.dump());
                     }
 
-                    // Run LLM → TTS
+                    // Run LLM → TTS (can take 1-2s — session may be removed while we wait)
                     if (g_pipeline && g_pipeline->IsReady()) {
                       auto result = g_pipeline->ProcessText(asr_text, session_id);
+
+                      // Re-check: session may have been removed by disconnect handler
+                      // while ProcessText was running.  Accessing s after this point
+                      // would be use-after-free.
+                      s = g_session_mgr->FindSession(session_id);
+                      if (!s) {
+                        LOG_INFO("[ASR] session {} gone after LLM/TTS, discarding result", session_id);
+                        return;
+                      }
 
                       if (!result.llm_response.empty()) {
                         // Send LLM result to robot

@@ -63,7 +63,10 @@ void WsSignalingServer::Stop() {
     listen_fd_ = -1;
   }
 
-  // Close all client connections
+  // Close all client connections and move them out of the map.
+  // We must NOT hold conn_mutex_ while joining threads, because
+  // ClientReadLoop also tries to lock conn_mutex_ during cleanup.
+  std::vector<std::unique_ptr<WsConnection>> pending_cleanup;
   {
     std::lock_guard<std::mutex> lock(conn_mutex_);
     for (auto& [fd, conn] : connections_) {
@@ -72,19 +75,23 @@ void WsSignalingServer::Stop() {
       shutdown(fd, SHUT_RDWR);
       close(fd);
     }
-  }
-
-  // Join threads
-  if (accept_thread_.joinable()) accept_thread_.join();
-
-  {
-    std::lock_guard<std::mutex> lock(conn_mutex_);
+    // Move all connections out — ClientReadLoop won't find them
+    // and will skip its own erase, avoiding double-join.
     for (auto& [fd, conn] : connections_) {
-      if (conn->read_thread.joinable()) conn->read_thread.join();
-      if (conn->send_thread.joinable()) conn->send_thread.join();
+      pending_cleanup.push_back(std::move(conn));
     }
     connections_.clear();
+    connection_count_.store(0);
   }
+
+  // Join threads OUTSIDE the lock to avoid deadlock with ClientReadLoop
+  if (accept_thread_.joinable()) accept_thread_.join();
+
+  for (auto& conn : pending_cleanup) {
+    if (conn->read_thread.joinable()) conn->read_thread.join();
+    if (conn->send_thread.joinable()) conn->send_thread.join();
+  }
+  // pending_cleanup destroyed here — WsConnection dtors safe (threads already joined)
 
   LOG_INFO("[WS] signaling server stopped");
 }
@@ -378,28 +385,39 @@ void WsSignalingServer::ClientReadLoop(WsConnection* conn) {
 
   LOG_INFO("[WS] read loop exited for fd={}", conn->fd);
 
-  // Cleanup: remove from registry
+  // Signal send thread to stop and wait for it to finish.
+  // The send thread only locks conn->send_mutex, not conn_mutex_,
+  // so joining here is safe (no deadlock).
+  conn->active.store(false);
+  conn->need_exit.store(true);
+
+  if (conn->send_thread.joinable()) {
+    conn->send_thread.join();
+  }
+
+  int saved_fd = conn->fd;
+
+  // CRITICAL: We are running INSIDE conn->read_thread. If we erase the
+  // connection from the map, the WsConnection destructor destroys
+  // std::thread read_thread while it's still joinable → std::terminate().
+  // Detach ourselves first so the destructor is safe.
+  conn->read_thread.detach();
+
+  // Close socket and remove from registry
   {
     std::lock_guard<std::mutex> lock(conn_mutex_);
-    auto it = connections_.find(conn->fd);
+    auto it = connections_.find(saved_fd);
     if (it != connections_.end()) {
-      conn->active.store(false);
-      conn->need_exit.store(true);
-      shutdown(conn->fd, SHUT_RDWR);
-      close(conn->fd);
-
-      if (conn->send_thread.joinable()) {
-        // Detach send thread — it will exit when it sees need_exit
-        // (we can't join from read thread without risk of deadlock)
-      }
-
+      shutdown(saved_fd, SHUT_RDWR);
+      close(saved_fd);
       connections_.erase(it);
       connection_count_--;
     }
   }
 
+  // Call disconnect handler OUTSIDE the lock to avoid deadlock
   if (on_disconnect_) {
-    on_disconnect_(conn->fd);
+    on_disconnect_(saved_fd);
   }
 }
 

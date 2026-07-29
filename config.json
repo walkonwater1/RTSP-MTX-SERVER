@@ -57,5 +57,16 @@
     "push_channels": 1,
     "pull_format": "wav",
     "debug_dump_dir": "/tmp/rtsp-server/debug"
+  },
+  "skills": {
+    "enabled": true,
+    "function_calling_enabled": true,
+    "fc_model": ""
+  },
+  "memory": {
+    "enabled": true,
+    "max_rounds": 10,
+    "max_tokens": 512,
+    "persist_dir": "/tmp/rtsp-server/memory"
   }
 }
