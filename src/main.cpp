@@ -314,6 +314,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
         session->asr_buffer.clear();
         session->asr_finalized = false;
         session->speech_detected = false;
+        session->silence_frames = 0;
       }
       session->llm_triggered = false;  // reset for new wakeup
       session->first_utterance = true;  // first speech after wake skips cooldown
@@ -343,7 +344,8 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               static constexpr int kMaxBufferSamples = 16000 * 60; // 60 seconds max
               static constexpr float kSpeechRms = 0.02f;           // RMS above this = speech
               static constexpr float kSilenceRms = 0.008f;         // RMS below this = silence
-              static constexpr int kCooldownMs = 3000;             // min interval between ASR triggers
+              static constexpr int kCooldownMs = 1500;             // min interval between ASR triggers (was 3000)
+              static constexpr int kMinAudioSamples = 16000 / 2;   // min 0.5s audio (was 1s)
 
               int current_samples = s->asr_buffer.size() / sizeof(int16_t);
 
@@ -358,14 +360,20 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               // Speech detection: high energy → someone is talking
               if (rms > kSpeechRms) {
                 s->speech_detected = true;
+                s->silence_frames = 0;  // reset silence counter on speech
               }
 
-              // End-of-speech detection: speech was detected, then silence follows
-              // Only trigger if: (a) speech was detected, (b) current chunk is silent,
-              // (c) enough total audio, (d) not already finalized, (e) cooldown elapsed.
+              // End-of-speech detection: speech was detected, then silence follows.
+              // Use a silence frame counter (hysteresis) to avoid premature trigger
+              // on brief pauses between syllables.
               bool is_silence = (rms < kSilenceRms);
+              if (is_silence && s->speech_detected) {
+                s->silence_frames++;
+              }
+
               bool has_speech = s->speech_detected;
-              bool enough_audio = (current_samples > 16000 * 1);  // at least 1s total
+              bool enough_audio = (current_samples > kMinAudioSamples);  // min 0.5s
+              bool enough_silence = (s->silence_frames >= Session::kSilenceFramesThreshold);
               bool cooldown_ok = true;
               if (!s->first_utterance) {
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -373,7 +381,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                 cooldown_ok = (now_ms - s->last_asr_finalized_ms) > kCooldownMs;
               }
 
-              if (is_silence && has_speech && enough_audio && !s->asr_finalized && cooldown_ok) {
+              if (is_silence && has_speech && enough_audio && enough_silence && !s->asr_finalized && cooldown_ok) {
                 s->asr_finalized = true;
                 LOG_INFO("[ASR] speech segment end for session {} ({} samples, rms={:.4f})",
                          session_id, current_samples, rms);
@@ -394,6 +402,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                     s->asr_buffer.clear();
                     s->asr_finalized = false;
                     s->speech_detected = false;  // reset for next utterance
+                    s->silence_frames = 0;
                     s->first_utterance = false;  // subsequent utterances need cooldown
                     s->last_asr_finalized_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -424,6 +433,17 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       g_ws_server->SendMessage(s->ws_fd, asr_msg.dump());
                     }
 
+                    // Pre-start RTSP push pipeline so ffmpeg connects to MediaMTX
+                    // in parallel with the LLM call (saves ~200-500ms).
+                    AudioPushPipeline* push = nullptr;
+                    if (g_rtsp_manager) {
+                      Session* s_push = g_session_mgr->FindSession(session_id);
+                      if (s_push) {
+                        push = g_rtsp_manager->StartAudioPush(session_id,
+                            s_push->rtsp_pull_url);
+                      }
+                    }
+
                     // Run LLM → TTS (can take 1-2s — session may be removed while we wait)
                     if (g_pipeline && g_pipeline->IsReady()) {
                       auto result = g_pipeline->ProcessText(asr_text, session_id);
@@ -434,6 +454,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       s = g_session_mgr->FindSession(session_id);
                       if (!s) {
                         LOG_INFO("[ASR] session {} gone after LLM/TTS, discarding result", session_id);
+                        if (g_rtsp_manager) g_rtsp_manager->StopAudioPush(session_id);
                         return;
                       }
 
@@ -461,12 +482,6 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               std::chrono::system_clock::now().time_since_epoch()).count();
                           s->tts_queue.push_back(item);
 
-                          // Start push pipeline (ffmpeg connects to MediaMTX as publisher)
-                          AudioPushPipeline* push = nullptr;
-                          if (g_rtsp_manager) {
-                            push = g_rtsp_manager->StartAudioPush(session_id, s->rtsp_pull_url);
-                          }
-
                           // Send tts_start FIRST — robot needs to start pulling before we push
                           if (g_ws_server) {
                             json tts_msg;
@@ -482,42 +497,59 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                                      session_id, item.tts_id);
                           }
 
-                          // Wait for robot to start pulling, then feed audio
+                          // Wait for robot to start pulling, then feed audio incrementally.
+                          // If streaming mode produced per-sentence WAVs, push them
+                          // one by one for lower time-to-first-audio latency.
                           if (push) {
-                            // Read WAV file
-                            std::ifstream wav(item.audio_path, std::ios::binary);
-                            if (wav) {
-                              wav.seekg(44);  // skip WAV header
-                              std::vector<int16_t> wav_data;
-                              int16_t sample;
-                              while (wav.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
-                                wav_data.push_back(sample);
+                            // Wait for pull_ready once (before first audio chunk)
+                            {
+                              std::unique_lock<std::mutex> pr_lock(s->pull_ready_mutex);
+                              if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(2500),
+                                  [&s] { return s->pull_ready; })) {
+                                LOG_WARN("[TTS] timeout waiting for pull_ready, pushing anyway");
                               }
-                              // Wait for robot to confirm pull connection.
-                              // Robot sends playback_status(started) or tts_state(is_playing=true)
-                              // as soon as pull is established (typically <100ms).
-                              // Timeout at 2500ms as safety net for edge cases.
-                              {
-                                std::unique_lock<std::mutex> pr_lock(s->pull_ready_mutex);
-                                if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(2500),
-                                    [&s] { return s->pull_ready; })) {
-                                  LOG_WARN("[TTS] timeout waiting for pull_ready, pushing anyway");
-                                }
-                                s->pull_ready = false;  // reset for next utterance
-                              }
-                              g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
-                              LOG_INFO("[TTS] pushed {} samples to RTSP for session {}",
-                                       wav_data.size(), session_id);
-                              // -re flag makes ffmpeg read at real-time speed.
-                              // Signal EOF now; PushLoop will drain the ring buffer
-                              // at 1x speed (~6.8s), then close ffmpeg cleanly.
-                              g_rtsp_manager->SignalPushEof(push);
+                              s->pull_ready = false;
                             }
+
+                            const auto& audio_files = result.sentence_audio_paths.empty()
+                                ? std::vector<std::string>{item.audio_path}
+                                : result.sentence_audio_paths;
+
+                            int total_samples = 0;
+                            for (size_t fi = 0; fi < audio_files.size(); fi++) {
+                              std::ifstream wav(audio_files[fi], std::ios::binary);
+                              if (wav) {
+                                wav.seekg(0, std::ios::end);
+                                size_t file_size = wav.tellg();
+                                wav.seekg(44);
+                                size_t data_samples = (file_size - 44) / sizeof(int16_t);
+                                std::vector<int16_t> wav_data(data_samples);
+                                wav.read(reinterpret_cast<char*>(wav_data.data()),
+                                         data_samples * sizeof(int16_t));
+                                g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
+                                total_samples += wav_data.size();
+                                LOG_INFO("[TTS] pushed sentence {}/{} ({} samples) for session {}",
+                                         fi + 1, audio_files.size(), wav_data.size(), session_id);
+                              }
+                            }
+                            LOG_INFO("[TTS] total {} samples across {} sentence(s) for session {}",
+                                     total_samples, audio_files.size(), session_id);
+                            g_rtsp_manager->SignalPushEof(push);
                           }
 
                           s->TransitionTo(SessionState::Playing);
                           s->current_tts_id = item.tts_id;
                         }
+                      } else {
+                        // LLM returned empty or TTS failed — clean up pre-started push
+                        if (push && g_rtsp_manager) {
+                          g_rtsp_manager->StopAudioPush(session_id);
+                        }
+                      }
+                    } else {
+                      // No pipeline or not ready — clean up push
+                      if (push && g_rtsp_manager) {
+                        g_rtsp_manager->StopAudioPush(session_id);
                       }
                     }
                   }).detach();
@@ -587,12 +619,12 @@ static void HandleWsMessage(int client_fd, const std::string& event,
             if (push) {
               std::ifstream wav(next.audio_path, std::ios::binary);
               if (wav) {
+                wav.seekg(0, std::ios::end);
+                size_t file_size = wav.tellg();
                 wav.seekg(44);
-                std::vector<int16_t> wav_data;
-                int16_t sample;
-                while (wav.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
-                  wav_data.push_back(sample);
-                }
+                size_t data_samples = (file_size - 44) / sizeof(int16_t);
+                std::vector<int16_t> wav_data(data_samples);
+                wav.read(reinterpret_cast<char*>(wav_data.data()), data_samples * sizeof(int16_t));
                 g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
                 g_rtsp_manager->SignalPushEof(push);
               }
@@ -797,7 +829,8 @@ int main(int argc, char* argv[]) {
 
   // Create directories
   system("mkdir -p /tmp/rtsp-server/debug");
-  system("mkdir -p /tmp/rtsp-server/tts-cache");
+  system("mkdir -p /dev/shm/rtsp-server/tts-cache");
+  system("mkdir -p /dev/shm/rtsp-server");
 
   // --- Init pipeline ---
   PipelineBridge pipeline(cfg.pipeline);

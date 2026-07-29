@@ -37,7 +37,7 @@
     "piper_model": "/home/lixin/pretrained_models/piper/zh_CN/zh_CN-huayan-medium.onnx",
     "output_sample_rate": 16000,
     "cache_tts": true,
-    "cache_dir": "/tmp/rtsp-server/tts-cache"
+    "cache_dir": "/dev/shm/rtsp-server/tts-cache"
   },
   "vad": {
     "backend": "adaptive",

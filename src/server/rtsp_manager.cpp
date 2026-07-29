@@ -58,27 +58,23 @@ void RtspManager::Stop() {
 
   LOG_INFO("[RTSP] stopping all pipelines...");
 
-  // Stop all pull pipelines
+  // Signal all pipelines to exit.
+  // IMPORTANT: do NOT pclose before joining — the loop threads may still be
+  // in fread/fwrite and pclose from here would race, causing double-free.
+  // PushLoop checks need_exit every 20ms via its cv timeout; PullLoop's
+  // fread will unblock when the ffmpeg child exits.
   {
     std::lock_guard<std::mutex> lock(pipelines_mutex_);
     for (auto& p : pull_pipelines_) {
       p->need_exit.store(true);
-      if (p->ffmpeg_pipe) {
-        pclose(p->ffmpeg_pipe);
-        p->ffmpeg_pipe = nullptr;
-      }
     }
     for (auto& p : push_pipelines_) {
       p->need_exit.store(true);
       p->buf_cv.notify_all();
-      if (p->ffmpeg_pipe) {
-        pclose(p->ffmpeg_pipe);
-        p->ffmpeg_pipe = nullptr;
-      }
     }
   }
 
-  // Join threads
+  // Join all threads (now safe — loops will exit on need_exit or broken pipe)
   {
     std::lock_guard<std::mutex> lock(pipelines_mutex_);
     for (auto& p : pull_pipelines_) {
@@ -86,6 +82,19 @@ void RtspManager::Stop() {
     }
     for (auto& p : push_pipelines_) {
       if (p->push_thread.joinable()) p->push_thread.join();
+    }
+    // Fallback: pclose any pipes the loops didn't clean up themselves
+    for (auto& p : pull_pipelines_) {
+      if (p->ffmpeg_pipe) {
+        pclose(p->ffmpeg_pipe);
+        p->ffmpeg_pipe = nullptr;
+      }
+    }
+    for (auto& p : push_pipelines_) {
+      if (p->ffmpeg_pipe) {
+        pclose(p->ffmpeg_pipe);
+        p->ffmpeg_pipe = nullptr;
+      }
     }
     pull_pipelines_.clear();
     push_pipelines_.clear();
@@ -216,11 +225,18 @@ void RtspManager::StopAudioPull(const std::string& session_id) {
   if (it != pull_pipelines_.end()) {
     auto* p = it->get();
     p->need_exit.store(true);
+
+    // Do NOT pclose here — PullLoop will pclose its own pipe after breaking
+    // out of the fread loop. Calling pclose before joining races with
+    // PullLoop's fread/pclose and causes double-free.
+
+    if (p->pull_thread.joinable()) p->pull_thread.join();
+
+    // Fallback cleanup after thread has definitely exited
     if (p->ffmpeg_pipe) {
       pclose(p->ffmpeg_pipe);
       p->ffmpeg_pipe = nullptr;
     }
-    if (p->pull_thread.joinable()) p->pull_thread.join();
     pull_pipelines_.erase(it);
     LOG_INFO("[RTSP-PULL] stopped for session {}", session_id);
   }
@@ -250,7 +266,7 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
     pipeline->state.store(RtspPipelineState::Running);
 
     // Read decoded PCM from ffmpeg stdout
-    std::vector<int16_t> buf(4096);
+    std::vector<int16_t> buf(1024);  // 64ms at 16kHz (was 4096=256ms)
 
     while (!pipeline->need_exit.load()) {
       size_t n_read = fread(buf.data(), sizeof(int16_t), buf.size(), pipeline->ffmpeg_pipe);
@@ -383,11 +399,19 @@ void RtspManager::StopAudioPush(const std::string& session_id) {
     auto* p = it->get();
     p->need_exit.store(true);
     p->buf_cv.notify_all();
+
+    // Do NOT pclose here — PushLoop checks need_exit every 20ms via its cv
+    // timeout, then pclose-s its own pipe. Calling pclose before joining
+    // races with PushLoop's fwrite/pclose and causes double-free.
+
+    if (p->push_thread.joinable()) p->push_thread.join();
+
+    // Fallback: if PushLoop didn't clean up (e.g., it exited early due to error),
+    // close the pipe now that the thread has definitely finished.
     if (p->ffmpeg_pipe) {
       pclose(p->ffmpeg_pipe);
       p->ffmpeg_pipe = nullptr;
     }
-    if (p->push_thread.joinable()) p->push_thread.join();
     push_pipelines_.erase(it);
     LOG_INFO("[RTSP-PUSH] stopped for session {}", session_id);
   }
@@ -451,7 +475,7 @@ void RtspManager::PushLoop(AudioPushPipeline* pipeline) {
     unsigned int read;
     {
       std::unique_lock<std::mutex> lock(pipeline->buf_mutex);
-      pipeline->buf_cv.wait_for(lock, std::chrono::milliseconds(100),
+      pipeline->buf_cv.wait_for(lock, std::chrono::milliseconds(20),  // was 100ms
           [pipeline] {
             return (pipeline->write_pos != pipeline->read_pos) ||
                    pipeline->need_exit.load() || pipeline->eof_signaled;
