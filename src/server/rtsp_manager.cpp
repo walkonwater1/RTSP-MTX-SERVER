@@ -233,6 +233,10 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
   constexpr int kMaxRetries = 50;
   constexpr int kBaseDelayMs = 500;
   constexpr int kMaxDelayMs = 5000;
+  // After this many consecutive EOFs, robot is likely sleeping (no RTSP publisher).
+  // Switch to slow retry with reduced logging to avoid log spam.
+  constexpr int kFastRetryLimit = 3;
+  constexpr int kSleepRetryDelayMs = 30000;
 
   while (!pipeline->need_exit.load() && retry_count < kMaxRetries) {
     if (!LaunchPullFfmpeg(pipeline)) {
@@ -247,7 +251,6 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
 
     // Read decoded PCM from ffmpeg stdout
     std::vector<int16_t> buf(4096);
-    bool eof_or_error = false;
 
     while (!pipeline->need_exit.load()) {
       size_t n_read = fread(buf.data(), sizeof(int16_t), buf.size(), pipeline->ffmpeg_pipe);
@@ -255,11 +258,10 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
         if (ferror(pipeline->ffmpeg_pipe)) {
           LOG_WARN("[RTSP-PULL] read error for session {}: {}",
                    pipeline->session_id, strerror(errno));
-        } else {
+        } else if (retry_count < kFastRetryLimit) {
           LOG_INFO("[RTSP-PULL] ffmpeg EOF for session {} (retry {}/{})",
                    pipeline->session_id, retry_count, kMaxRetries);
         }
-        eof_or_error = true;
         break;
       }
 
@@ -277,11 +279,19 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
 
     if (pipeline->need_exit.load()) break;
 
-    // Retry with backoff
+    // Retry with backoff. After kFastRetryLimit consecutive failures,
+    // assume robot is sleeping and use a long retry interval.
     retry_count++;
-    int delay = std::min(kBaseDelayMs * (1 << std::min(retry_count, 4)), kMaxDelayMs);
-    LOG_INFO("[RTSP-PULL] reconnecting in {} ms (attempt {}/{})",
-             delay, retry_count, kMaxRetries);
+    int delay;
+    if (retry_count <= kFastRetryLimit) {
+      delay = std::min(kBaseDelayMs * (1 << std::min(retry_count, 4)), kMaxDelayMs);
+      LOG_INFO("[RTSP-PULL] reconnecting in {} ms (attempt {}/{})",
+               delay, retry_count, kMaxRetries);
+    } else {
+      delay = kSleepRetryDelayMs;
+      LOG_DEBUG("[RTSP-PULL] no publisher, slow retry in {}s (attempt {}/{})",
+                delay / 1000, retry_count, kMaxRetries);
+    }
 
     for (int waited = 0; waited < delay && !pipeline->need_exit.load(); waited += 100) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
