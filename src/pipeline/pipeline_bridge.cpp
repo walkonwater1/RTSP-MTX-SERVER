@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 
 #include <curl/curl.h>
@@ -258,55 +259,77 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
     }
   }
 
-  // Generate TTS using espeak-ng (simple approach for stub mode)
-  // When linked with HAS_VOICE_PIPELINE, this would use Piper.
+  // Generate TTS using the configured backend.
+  // When linked with HAS_VOICE_PIPELINE, this uses the native Piper library.
   std::ostringstream cmd;
 
 #ifdef HAS_VOICE_PIPELINE
-  // Piper TTS call
+  // Native Piper TTS
   cmd << "echo '" << EscapeJson(text) << "' | "
       << "piper --model " << cfg_.tts_piper_model
       << " --output_file " << output_path;
 #else
-  // Fallback: espeak-ng stdout → ffmpeg resample to 16kHz → WAV
-  cmd << "espeak-ng -v " << cfg_.tts_voice
-      << " -s " << cfg_.tts_rate
-      << " --stdout"
-      << " \"" << EscapeJson(text) << "\""
-      << " 2>/dev/null"
-      << " | ffmpeg -f s16le -ar 22050 -ac 1 -i pipe:0"
-      << " -ar 16000 -ac 1"
-      << " -y " << output_path
-      << " 2>/dev/null";
-
-  // Check if espeak-ng is available, otherwise create a minimal WAV
-  if (system("which espeak-ng >/dev/null 2>&1") != 0) {
-    LOG_WARN("[TTS] espeak-ng not found, creating empty WAV placeholder");
-    // Create a minimal silent WAV
-    std::ofstream f(output_path, std::ios::binary);
-    if (f) {
-      uint32_t data_size = 16000;  // 0.5s @ 16kHz
-      uint32_t file_size = 36 + data_size;
-      f.write("RIFF", 4);
-      f.write(reinterpret_cast<const char*>(&file_size), 4);
-      f.write("WAVE", 4);
-      f.write("fmt ", 4);
-      uint32_t fmt_size = 16;
-      uint16_t audio_fmt = 1, num_ch = 1, block_align = 2, bps = 16;
-      uint32_t sample_rate = 16000, byte_rate = 32000;
-      f.write(reinterpret_cast<const char*>(&fmt_size), 4);
-      f.write(reinterpret_cast<const char*>(&audio_fmt), 2);
-      f.write(reinterpret_cast<const char*>(&num_ch), 2);
-      f.write(reinterpret_cast<const char*>(&sample_rate), 4);
-      f.write(reinterpret_cast<const char*>(&byte_rate), 4);
-      f.write(reinterpret_cast<const char*>(&block_align), 2);
-      f.write(reinterpret_cast<const char*>(&bps), 2);
-      f.write("data", 4);
-      f.write(reinterpret_cast<const char*>(&data_size), 4);
-      std::vector<char> silence(data_size, 0);
-      f.write(silence.data(), data_size);
+  // Stub mode: use external Piper or espeak-ng depending on config
+  if (cfg_.tts_backend == "piper" && !cfg_.tts_piper_model.empty()) {
+    // Check if piper binary is available
+    bool have_piper = (system("which piper >/dev/null 2>&1") == 0);
+    if (have_piper) {
+      // Piper model sample rate (huayan = 22050, most others = 22050)
+      // Pipe through ffmpeg to resample to 16kHz for robot compatibility.
+      cmd << "echo " << std::quoted(text) << " | "
+          << "piper --model " << cfg_.tts_piper_model
+          << " --output-raw 2>/dev/null"
+          << " | ffmpeg -f s16le -ar 22050 -ac 1 -i pipe:0"
+          << " -ar " << cfg_.tts_sample_rate << " -ac 1"
+          << " -y " << output_path
+          << " 2>/dev/null";
+    } else {
+      LOG_WARN("[TTS] piper requested but not installed, falling back to espeak-ng");
+      have_piper = false;
     }
-    return true;
+  }
+
+  // Fallback to espeak-ng
+  if (cmd.str().empty()) {
+    cmd << "espeak-ng -v " << cfg_.tts_voice
+        << " -s " << cfg_.tts_rate
+        << " --stdout"
+        << " \"" << EscapeJson(text) << "\""
+        << " 2>/dev/null"
+        << " | ffmpeg -f s16le -ar 22050 -ac 1 -i pipe:0"
+        << " -ar " << cfg_.tts_sample_rate << " -ac 1"
+        << " -y " << output_path
+        << " 2>/dev/null";
+
+    // Check if espeak-ng is available
+    if (system("which espeak-ng >/dev/null 2>&1") != 0) {
+      LOG_WARN("[TTS] espeak-ng not found, creating empty WAV placeholder");
+      // Create a minimal silent WAV
+      std::ofstream f(output_path, std::ios::binary);
+      if (f) {
+        uint32_t data_size = 16000;
+        uint32_t file_size = 36 + data_size;
+        f.write("RIFF", 4);
+        f.write(reinterpret_cast<const char*>(&file_size), 4);
+        f.write("WAVE", 4);
+        f.write("fmt ", 4);
+        uint32_t fmt_size = 16;
+        uint16_t audio_fmt = 1, num_ch = 1, block_align = 2, bps = 16;
+        uint32_t sample_rate = 16000, byte_rate = 32000;
+        f.write(reinterpret_cast<const char*>(&fmt_size), 4);
+        f.write(reinterpret_cast<const char*>(&audio_fmt), 2);
+        f.write(reinterpret_cast<const char*>(&num_ch), 2);
+        f.write(reinterpret_cast<const char*>(&sample_rate), 4);
+        f.write(reinterpret_cast<const char*>(&byte_rate), 4);
+        f.write(reinterpret_cast<const char*>(&block_align), 2);
+        f.write(reinterpret_cast<const char*>(&bps), 2);
+        f.write("data", 4);
+        f.write(reinterpret_cast<const char*>(&data_size), 4);
+        std::vector<char> silence(data_size, 0);
+        f.write(silence.data(), data_size);
+      }
+      return true;
+    }
   }
 #endif
 

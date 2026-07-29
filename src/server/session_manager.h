@@ -85,9 +85,11 @@ struct Session {
 
   // ASR accumulation
   std::mutex asr_mutex;
-  std::string asr_buffer;         // accumulated ASR text
-  bool asr_finalized = false;    // set when speech segment complete
-  bool llm_triggered = false;    // dedup: only one LLM call per wakeup session
+  std::string asr_buffer;          // accumulated raw PCM audio
+  bool asr_finalized = false;     // set when speech segment complete
+  bool llm_triggered = false;     // dedup: only one LLM call per wakeup session
+  bool speech_detected = false;   // set when actual speech energy is detected
+  int64_t last_asr_finalized_ms = 0;  // cooldown: prevent rapid re-trigger
 
   // WebSocket connection fd (for sending messages directly)
   int ws_fd = -1;

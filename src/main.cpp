@@ -122,10 +122,9 @@ struct ServerConfig {
 
 // --- Signal handler ---
 static void SignalHandler(int sig) {
-  LOG_INFO("Received signal {}, shutting down...", sig);
+  // ASYNC-SIGNAL-SAFE: only set the flag. The main loop handles actual shutdown.
+  // Calling Stop() from a signal handler risks deadlock (mutexes, thread joins).
   g_running.store(false);
-  if (g_ws_server) g_ws_server->Stop();
-  if (g_rtsp_manager) g_rtsp_manager->Stop();
 }
 
 // --- Config loading ---
@@ -299,62 +298,84 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               Session* s = g_session_mgr->FindSession(session_id);
               if (!s || !s->audio_streaming.load()) return;
 
+              // Suppress ASR accumulation while TTS is playing — the mic
+              // captures speaker output + ambient noise, not user speech.
+              if (s->GetState() == SessionState::Playing) return;
+
               std::lock_guard<std::mutex> lock(s->asr_mutex);
 
-              // Append PCM to buffer (simple accumulation for now)
-              // In production, this would feed into a VAD + streaming ASR pipeline
+              // Append PCM to buffer
               s->asr_buffer.append(reinterpret_cast<const char*>(pcm), n * sizeof(int16_t));
 
-              // Simple silence detection: if we have enough audio and detect silence,
-              // finalize the ASR segment
               static constexpr int kMaxBufferSamples = 16000 * 60; // 60 seconds max
+              static constexpr float kSpeechRms = 0.02f;           // RMS above this = speech
+              static constexpr float kSilenceRms = 0.008f;         // RMS below this = silence
+              static constexpr int kCooldownMs = 3000;             // min interval between ASR triggers
+
               int current_samples = s->asr_buffer.size() / sizeof(int16_t);
 
-              // Check for end of speech: silence detection (simple energy-based)
-              if (current_samples > 16000 * 1) { // at least 1 second
-                // Calculate RMS of last chunk
-                int chunk = std::min(n, 1600); // 100ms
-                float sum_sq = 0;
-                for (int i = n - chunk; i < n; i++) {
-                  float sample = pcm[i] / 32768.0f;
-                  sum_sq += sample * sample;
-                }
-                float rms = std::sqrt(sum_sq / chunk);
+              // Calculate RMS of current chunk
+              float sum_sq = 0;
+              for (int i = 0; i < n; i++) {
+                float sample = pcm[i] / 32768.0f;
+                sum_sq += sample * sample;
+              }
+              float rms = std::sqrt(sum_sq / n);
 
-                // If energy is very low and we have enough speech, finalize
-                if (rms < 0.01f && !s->asr_finalized && current_samples > 16000 * 2) {
-                  s->asr_finalized = true;
-                  LOG_INFO("[ASR] speech segment end detected for session {} ({} samples, rms={:.4f})",
-                           session_id, current_samples, rms);
+              // Speech detection: high energy → someone is talking
+              if (rms > kSpeechRms) {
+                s->speech_detected = true;
+              }
 
-                  // Process ASR in a background thread to not block the audio callback
-                  std::thread([session_id]() {
-                    Session* s = g_session_mgr->FindSession(session_id);
-                    if (!s) return;
+              // End-of-speech detection: speech was detected, then silence follows
+              // Only trigger if: (a) speech was detected, (b) current chunk is silent,
+              // (c) enough total audio, (d) not already finalized, (e) cooldown elapsed.
+              bool is_silence = (rms < kSilenceRms);
+              bool has_speech = s->speech_detected;
+              bool enough_audio = (current_samples > 16000 * 1);  // at least 1s total
+              bool cooldown_ok = true;
+              {
+                int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                cooldown_ok = (now_ms - s->last_asr_finalized_ms) > kCooldownMs;
+              }
 
-                    std::string asr_text;
-                    {
-                      std::lock_guard<std::mutex> lock(s->asr_mutex);
-                      if (g_pipeline && g_pipeline->IsReady()) {
-                        auto* pcm_ptr = reinterpret_cast<const int16_t*>(s->asr_buffer.data());
-                        int pcm_count = s->asr_buffer.size() / sizeof(int16_t);
-                        asr_text = g_pipeline->TranscribeAudio(pcm_ptr, pcm_count);
-                      }
-                      s->asr_buffer.clear();
-                      s->asr_finalized = false;
+              if (is_silence && has_speech && enough_audio && !s->asr_finalized && cooldown_ok) {
+                s->asr_finalized = true;
+                LOG_INFO("[ASR] speech segment end for session {} ({} samples, rms={:.4f})",
+                         session_id, current_samples, rms);
+
+                // Process ASR in a background thread to not block the audio callback
+                std::thread([session_id]() {
+                  Session* s = g_session_mgr->FindSession(session_id);
+                  if (!s) return;
+
+                  std::string asr_text;
+                  {
+                    std::lock_guard<std::mutex> lock(s->asr_mutex);
+                    if (g_pipeline && g_pipeline->IsReady()) {
+                      auto* pcm_ptr = reinterpret_cast<const int16_t*>(s->asr_buffer.data());
+                      int pcm_count = s->asr_buffer.size() / sizeof(int16_t);
+                      asr_text = g_pipeline->TranscribeAudio(pcm_ptr, pcm_count);
                     }
+                    s->asr_buffer.clear();
+                    s->asr_finalized = false;
+                    s->speech_detected = false;  // reset for next utterance
+                    s->last_asr_finalized_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                  }
 
-                    if (asr_text.empty()) {
-                      LOG_DEBUG("[ASR] no text recognized for session {}", session_id);
-                      return;
-                    }
+                  if (asr_text.empty()) {
+                    LOG_DEBUG("[ASR] no text recognized for session {}", session_id);
+                    return;
+                  }
 
-                    // Dedup: only one LLM call per wakeup session
-                    if (s->llm_triggered) {
-                      LOG_DEBUG("[ASR] LLM already triggered for session {}, skipping", session_id);
-                      return;
-                    }
-                    s->llm_triggered = true;
+                  // Dedup: only one LLM call per conversation turn
+                  if (s->llm_triggered) {
+                    LOG_DEBUG("[ASR] LLM already triggered for session {}, skipping", session_id);
+                    return;
+                  }
+                  s->llm_triggered = true;
 
                     LOG_INFO("[ASR] recognized: \"{}\" for session {}", asr_text, session_id);
 
@@ -457,8 +478,8 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                   LOG_WARN("[ASR] buffer overflow for session {}, resetting", session_id);
                   s->asr_buffer.clear();
                   s->asr_finalized = false;
+                  s->speech_detected = false;
                 }
-              }
             });
       }
 
@@ -491,6 +512,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
       if (status == "completed") {
         // Robot finished playing TTS → resume ASR
+        session->llm_triggered = false;  // re-arm for next speech turn
         session->TransitionTo(SessionState::Streaming);
         session->current_tts_id.clear();
 
@@ -540,7 +562,13 @@ static void HandleWsMessage(int client_fd, const std::string& event,
           session->TransitionTo(SessionState::Playing);
         }
       } else if (status == "started") {
-        // Robot started playing TTS — VAD suppression is robot-side
+        // Robot started playing TTS — discard stale audio and suppress VAD
+        {
+          std::lock_guard<std::mutex> lock(session->asr_mutex);
+          session->asr_buffer.clear();
+          session->speech_detected = false;
+          session->asr_finalized = false;
+        }
         session->TransitionTo(SessionState::Playing);
       }
 
@@ -565,6 +593,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
       if (!is_playing && (reason == "ended" || reason == "stop_tts" ||
                           reason == "interrupt" || reason == "client_stop")) {
+        session->llm_triggered = false;  // re-arm for next speech turn
         session->TransitionTo(SessionState::Streaming);
       }
 
@@ -757,13 +786,14 @@ int main(int argc, char* argv[]) {
   LOG_INFO("");
 
   // --- Main loop ---
+  // Poll at 100ms for responsive shutdown (signals may not interrupt sleep_for).
   while (g_running.load()) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Periodic status
     static int tick = 0;
     tick++;
-    if (tick % 60 == 0) {  // every 60 seconds
+    if (tick % 600 == 0) {  // every 60 seconds (600 * 100ms)
       LOG_INFO("[Status] {} active sessions, {} WS connections",
                session_mgr.SessionCount(), ws_server.ConnectionCount());
     }

@@ -54,6 +54,8 @@ bool RtspManager::Start() {
 }
 
 void RtspManager::Stop() {
+  if (stopped_.exchange(true)) return;  // idempotent
+
   LOG_INFO("[RTSP] stopping all pipelines...");
 
   // Stop all pull pipelines

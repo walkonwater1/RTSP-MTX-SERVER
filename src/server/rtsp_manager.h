@@ -183,6 +183,7 @@ private:
   std::mutex pipelines_mutex_;
   std::vector<std::unique_ptr<AudioPullPipeline>> pull_pipelines_;
   std::vector<std::unique_ptr<AudioPushPipeline>> push_pipelines_;
+  std::atomic<bool> stopped_{false};
 };
 
 } // namespace rtsp_server

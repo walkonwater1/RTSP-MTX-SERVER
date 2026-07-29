@@ -24,17 +24,17 @@
     "sample_rate": 16000
   },
   "llm": {
-    "host": "http://localhost:11434",
-    "model": "qwen2.5:1.5b",
+    "host": "http://192.168.10.54:11434",
+    "model": "qwen2.5:7b",
     "system_prompt": "你是小千，一个18岁女大学生，性格活泼开朗，像朋友聊天一样自然。回复控制在2-3句话，约50字。不要复读用户原话，直接回应问题本身。",
-    "timeout_sec": 30,
+    "timeout_sec": 60,
     "max_response_tokens": 256
   },
   "tts": {
     "backend": "piper",
     "rate": 200,
     "voice": "cmn+f3",
-    "piper_model": "~/pretrained_models/piper/zh_CN/zh_CN-huayan-medium.onnx",
+    "piper_model": "/home/lixin/pretrained_models/piper/zh_CN/zh_CN-huayan-medium.onnx",
     "output_sample_rate": 16000,
     "cache_tts": true,
     "cache_dir": "/tmp/rtsp-server/tts-cache"

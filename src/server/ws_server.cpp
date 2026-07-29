@@ -51,10 +51,10 @@ bool WsSignalingServer::Start() {
 }
 
 void WsSignalingServer::Stop() {
-  if (!running_.load()) return;
+  if (stopped_.exchange(true)) return;  // idempotent
+  running_.store(false);
 
   LOG_INFO("[WS] stopping signaling server...");
-  running_.store(false);
 
   // Close listen socket to unblock accept()
   if (listen_fd_ >= 0) {

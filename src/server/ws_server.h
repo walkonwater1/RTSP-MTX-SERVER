@@ -147,6 +147,7 @@ private:
 
   WsServerConfig cfg_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> stopped_{false};
   std::atomic<int> connection_count_{0};
 
   int listen_fd_ = -1;
