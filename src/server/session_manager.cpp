@@ -113,6 +113,20 @@ std::vector<Session*> SessionManager::GetAllSessions() {
   return result;
 }
 
+std::vector<std::string> SessionManager::GetExpiredSessionIds(int64_t timeout_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+
+  std::vector<std::string> ids;
+  for (const auto& s : sessions_) {
+    if ((now - s->last_activity_ms) > timeout_ms) {
+      ids.push_back(s->session_id);
+    }
+  }
+  return ids;
+}
+
 int SessionManager::PurgeExpired(int64_t timeout_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -185,6 +185,14 @@ public:
   int PurgeExpired(int64_t timeout_ms);
 
   /**
+   * @brief Get IDs of expired sessions without removing them.
+   *        Caller should stop RTSP pipelines before calling RemoveSession.
+   * @param timeout_ms max idle time in milliseconds
+   * @return vector of expired session IDs
+   */
+  std::vector<std::string> GetExpiredSessionIds(int64_t timeout_ms) const;
+
+  /**
    * @brief Number of active sessions.
    */
   size_t SessionCount() const;

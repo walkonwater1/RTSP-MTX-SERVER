@@ -185,6 +185,11 @@ void RtspManager::KillMediaMtx() {
 bool RtspManager::StartAudioPull(const std::string& session_id,
                                  const std::string& rtsp_url,
                                  std::function<void(const int16_t*, int)> on_pcm) {
+  // Stop any existing pull pipeline for this session before starting a new one.
+  // This handles sleep→wake cycles where start_push_audio is sent again
+  // for the same session but with a potentially new RTSP URL.
+  StopAudioPull(session_id);
+
   auto pipeline = std::make_unique<AudioPullPipeline>();
   pipeline->session_id = session_id;
   pipeline->rtsp_url = rtsp_url;
@@ -337,6 +342,10 @@ bool RtspManager::LaunchPullFfmpeg(AudioPullPipeline* pipeline) {
 
 AudioPushPipeline* RtspManager::StartAudioPush(const std::string& session_id,
                                                 const std::string& rtsp_url) {
+  // Stop any existing push pipeline for this session before starting a new one.
+  // Same reasoning as StartAudioPull: prevents duplicate pipelines on sleep→wake.
+  StopAudioPush(session_id);
+
   auto pipeline = std::make_unique<AudioPushPipeline>();
   pipeline->session_id = session_id;
   pipeline->rtsp_url = rtsp_url;

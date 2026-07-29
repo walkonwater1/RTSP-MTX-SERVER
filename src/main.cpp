@@ -301,8 +301,18 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       session->push_started_ms.store(
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count());
+
+      // Reset ASR state for new wakeup — stale state from before sleep
+      // would prevent recognition from working.
+      {
+        std::lock_guard<std::mutex> asr_lock(session->asr_mutex);
+        session->asr_buffer.clear();
+        session->asr_finalized = false;
+        session->speech_detected = false;
+      }
       session->llm_triggered = false;  // reset for new wakeup
       session->first_utterance = true;  // first speech after wake skips cooldown
+      session->pull_ready = false;  // reset pull sync state
       session->TransitionTo(SessionState::Streaming);
       session->Touch();
 
@@ -705,10 +715,20 @@ static void SessionCleanupLoop(ServerConfig& cfg) {
   while (g_running.load()) {
     std::this_thread::sleep_for(std::chrono::seconds(30));
 
-    int purged = g_session_mgr->PurgeExpired(cfg.session_timeout_sec * 1000);
-    if (purged > 0) {
+    // Collect expired session IDs before purging so we can stop their RTSP pipelines.
+    // PurgeExpired previously removed sessions without cleaning up RTSP,
+    // leaving stale ffmpeg processes running and consuming resources.
+    auto expired_ids = g_session_mgr->GetExpiredSessionIds(cfg.session_timeout_sec * 1000);
+    for (const auto& sid : expired_ids) {
+      if (g_rtsp_manager) {
+        g_rtsp_manager->StopAudioPull(sid);
+        g_rtsp_manager->StopAudioPush(sid);
+      }
+      g_session_mgr->RemoveSession(sid);
+    }
+    if (!expired_ids.empty()) {
       LOG_INFO("[Cleanup] purged {} expired sessions, {} remaining",
-               purged, g_session_mgr->SessionCount());
+               expired_ids.size(), g_session_mgr->SessionCount());
     }
   }
 }
