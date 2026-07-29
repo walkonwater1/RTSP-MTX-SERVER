@@ -217,12 +217,22 @@ PipelineResult PipelineBridge::ProcessAudio(const int16_t* pcm_data,
 // ASR Transcription (stub: uses system whisper or returns empty)
 // ---------------------------------------------------------------------------
 
-std::string PipelineBridge::TranscribeAudio(const int16_t* /*pcm_data*/,
-                                              int /*sample_count*/) {
-  // In stub mode, ASR is not available.
+std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
+                                              int sample_count) {
+  // In stub mode, ASR is not available — return a test prompt to exercise LLM.
   // When linked with HAS_VOICE_PIPELINE, this would call sherpa-onnx.
-  LOG_DEBUG("[Pipeline] TranscribeAudio: stub mode (no ASR available)");
+#ifdef HAS_VOICE_PIPELINE
+  (void)pcm_data;
+  (void)sample_count;
   return "";
+#else
+  if (sample_count < 16000) {
+    LOG_DEBUG("[Pipeline] TranscribeAudio: too few samples for stub ({}), skipping", sample_count);
+    return "";
+  }
+  LOG_INFO("[Pipeline] TranscribeAudio: stub mode, returning mock ASR text ({} samples)", sample_count);
+  return "你好，今天天气怎么样";
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -258,11 +268,15 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
       << "piper --model " << cfg_.tts_piper_model
       << " --output_file " << output_path;
 #else
-  // Fallback: espeak-ng → ffmpeg to WAV
+  // Fallback: espeak-ng stdout → ffmpeg resample to 16kHz → WAV
   cmd << "espeak-ng -v " << cfg_.tts_voice
       << " -s " << cfg_.tts_rate
-      << " -w " << output_path
+      << " --stdout"
       << " \"" << EscapeJson(text) << "\""
+      << " 2>/dev/null"
+      << " | ffmpeg -f s16le -ar 22050 -ac 1 -i pipe:0"
+      << " -ar 16000 -ac 1"
+      << " -y " << output_path
       << " 2>/dev/null";
 
   // Check if espeak-ng is available, otherwise create a minimal WAV

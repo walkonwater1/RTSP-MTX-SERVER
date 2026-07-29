@@ -3,14 +3,14 @@
     "ws_port": 8090,
     "ws_path": "/ws/rtsp",
     "rtsp_port": 8554,
-    "rtsp_base_url": "rtsp://0.0.0.0:8554",
+    "rtsp_base_url": "rtsp://192.168.2.110:8554",
     "bind_address": "0.0.0.0",
     "max_sessions": 32,
     "heartbeat_interval_sec": 15,
     "session_timeout_sec": 300
   },
   "mediamtx": {
-    "binary_path": "mediamtx",
+    "binary_path": "/home/lixin/.local/bin/mediamtx",
     "config_path": "",
     "auto_launch": true,
     "rtmp_disable": true,
@@ -25,7 +25,7 @@
   },
   "llm": {
     "host": "http://localhost:11434",
-    "model": "qwen2.5:3b",
+    "model": "qwen2.5:1.5b",
     "system_prompt": "你是小千，一个18岁女大学生，性格活泼开朗，像朋友聊天一样自然。回复控制在2-3句话，约50字。不要复读用户原话，直接回应问题本身。",
     "timeout_sec": 30,
     "max_response_tokens": 256

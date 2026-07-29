@@ -87,6 +87,7 @@ struct Session {
   std::mutex asr_mutex;
   std::string asr_buffer;         // accumulated ASR text
   bool asr_finalized = false;    // set when speech segment complete
+  bool llm_triggered = false;    // dedup: only one LLM call per wakeup session
 
   // WebSocket connection fd (for sending messages directly)
   int ws_fd = -1;

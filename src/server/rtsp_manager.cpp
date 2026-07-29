@@ -119,6 +119,7 @@ bool RtspManager::LaunchMediaMtx() {
     setenv("MTX_WEBRTCDISABLE", "yes", 1);  // disable WebRTC
     setenv("MTX_SRTDISABLE", "yes", 1);     // disable SRT
     setenv("MTX_LOGLEVEL", "info", 1);
+    setenv("MTX_PATHS_ALL_SOURCE", "publisher", 1);  // allow push on any path
 
     // Redirect stdout/stderr to log
     freopen("/tmp/rtsp-server/mediamtx.log", "w", stdout);
@@ -221,49 +222,66 @@ void RtspManager::StopAudioPull(const std::string& session_id) {
 void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
   LOG_INFO("[RTSP-PULL] loop started for session {}", pipeline->session_id);
 
-  if (!LaunchPullFfmpeg(pipeline)) {
-    LOG_ERROR("[RTSP-PULL] failed to launch ffmpeg pull for {}",
-              pipeline->session_id);
-    pipeline->state.store(RtspPipelineState::Error);
-    if (pipeline->on_disconnect) pipeline->on_disconnect(pipeline->session_id);
-    return;
-  }
+  int retry_count = 0;
+  constexpr int kMaxRetries = 50;
+  constexpr int kBaseDelayMs = 500;
+  constexpr int kMaxDelayMs = 5000;
 
-  pipeline->state.store(RtspPipelineState::Running);
+  while (!pipeline->need_exit.load() && retry_count < kMaxRetries) {
+    if (!LaunchPullFfmpeg(pipeline)) {
+      LOG_ERROR("[RTSP-PULL] failed to launch ffmpeg pull for {}",
+                pipeline->session_id);
+      pipeline->state.store(RtspPipelineState::Error);
+      if (pipeline->on_disconnect) pipeline->on_disconnect(pipeline->session_id);
+      return;
+    }
 
-  // Read decoded PCM from ffmpeg stdout
-  // ffmpeg outputs raw S16LE PCM at the sample rate we request (16kHz mono)
-  std::vector<int16_t> buf(4096);
-  int pull_loops = 0;
+    pipeline->state.store(RtspPipelineState::Running);
 
-  while (!pipeline->need_exit.load()) {
-    size_t n_read = fread(buf.data(), sizeof(int16_t), buf.size(), pipeline->ffmpeg_pipe);
-    if (n_read == 0) {
-      if (ferror(pipeline->ffmpeg_pipe)) {
-        LOG_WARN("[RTSP-PULL] read error for session {}: {}",
-                 pipeline->session_id, strerror(errno));
-      } else {
-        LOG_INFO("[RTSP-PULL] ffmpeg EOF for session {}", pipeline->session_id);
+    // Read decoded PCM from ffmpeg stdout
+    std::vector<int16_t> buf(4096);
+    bool eof_or_error = false;
+
+    while (!pipeline->need_exit.load()) {
+      size_t n_read = fread(buf.data(), sizeof(int16_t), buf.size(), pipeline->ffmpeg_pipe);
+      if (n_read == 0) {
+        if (ferror(pipeline->ffmpeg_pipe)) {
+          LOG_WARN("[RTSP-PULL] read error for session {}: {}",
+                   pipeline->session_id, strerror(errno));
+        } else {
+          LOG_INFO("[RTSP-PULL] ffmpeg EOF for session {} (retry {}/{})",
+                   pipeline->session_id, retry_count, kMaxRetries);
+        }
+        eof_or_error = true;
+        break;
       }
-      break;
+
+      if (pipeline->on_pcm_data) {
+        pipeline->on_pcm_data(buf.data(), static_cast<int>(n_read));
+      }
+      retry_count = 0;  // reset retry on successful read
     }
 
-    if (pipeline->on_pcm_data) {
-      pipeline->on_pcm_data(buf.data(), static_cast<int>(n_read));
+    // Close current ffmpeg
+    if (pipeline->ffmpeg_pipe) {
+      pclose(pipeline->ffmpeg_pipe);
+      pipeline->ffmpeg_pipe = nullptr;
     }
 
-    pull_loops++;
-    if (pull_loops % 100 == 0) {
-      LOG_DEBUG("[RTSP-PULL] alive, loops={}, samples_read={}",
-                pull_loops, pull_loops * buf.size());
+    if (pipeline->need_exit.load()) break;
+
+    // Retry with backoff
+    retry_count++;
+    int delay = std::min(kBaseDelayMs * (1 << std::min(retry_count, 4)), kMaxDelayMs);
+    LOG_INFO("[RTSP-PULL] reconnecting in {} ms (attempt {}/{})",
+             delay, retry_count, kMaxRetries);
+
+    for (int waited = 0; waited < delay && !pipeline->need_exit.load(); waited += 100) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 
   pipeline->state.store(RtspPipelineState::Idle);
-  if (pipeline->ffmpeg_pipe) {
-    pclose(pipeline->ffmpeg_pipe);
-    pipeline->ffmpeg_pipe = nullptr;
-  }
 
   LOG_INFO("[RTSP-PULL] loop exited for session {}", pipeline->session_id);
   if (pipeline->on_disconnect) {
@@ -462,9 +480,10 @@ bool RtspManager::LaunchPushFfmpeg(AudioPushPipeline* pipeline) {
   // ffmpeg -f s16le -ar 16000 -ac 1 -i pipe:0 -c:a aac -f rtsp -rtsp_transport tcp <url>
   std::ostringstream cmd;
   cmd << "ffmpeg"
+      << " -re"
       << " -f s16le -ar 16000 -ac 1"
       << " -i pipe:0"
-      << " -c:a aac"
+      << " -c:a aac -b:a 128k"
       << " -f rtsp"
       << " -rtsp_transport tcp"
       << " " << pipeline->rtsp_url

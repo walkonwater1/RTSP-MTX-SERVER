@@ -92,6 +92,7 @@ static WsSignalingServer* g_ws_server = nullptr;
 static RtspManager* g_rtsp_manager = nullptr;
 static SessionManager* g_session_mgr = nullptr;
 static PipelineBridge* g_pipeline = nullptr;
+static std::string g_rtsp_base_url = "rtsp://127.0.0.1:8554";
 
 // --- Configuration ---
 struct ServerConfig {
@@ -228,12 +229,8 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
       LOG_INFO("[MSG] req_stream from user='{}', mode={}", user_id, mode);
 
-      Session* session = g_session_mgr->CreateSession(user_id, mode,
-                                                       g_rtsp_manager ? "rtsp://127.0.0.1:" + std::to_string(
-                                                           ServerConfig{}.rtsp_port) : "rtsp://127.0.0.1:8554");
-
-      // Use the configured rtsp_base_url
-      std::string rtsp_base = "rtsp://127.0.0.1:8554";
+      // Use the configured rtsp_base_url (not hardcoded 127.0.0.1)
+      Session* session = g_session_mgr->CreateSession(user_id, mode, g_rtsp_base_url);
 
       if (!session) {
         json err;
@@ -288,6 +285,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       session->push_started_ms.store(
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count());
+      session->llm_triggered = false;  // reset for new wakeup
       session->TransitionTo(SessionState::Streaming);
       session->Touch();
 
@@ -351,6 +349,13 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       return;
                     }
 
+                    // Dedup: only one LLM call per wakeup session
+                    if (s->llm_triggered) {
+                      LOG_DEBUG("[ASR] LLM already triggered for session {}, skipping", session_id);
+                      return;
+                    }
+                    s->llm_triggered = true;
+
                     LOG_INFO("[ASR] recognized: \"{}\" for session {}", asr_text, session_id);
 
                     // Send ASR result to robot
@@ -392,27 +397,13 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               std::chrono::system_clock::now().time_since_epoch()).count();
                           s->tts_queue.push_back(item);
 
-                          // Push TTS audio to RTSP
+                          // Start push pipeline (ffmpeg connects to MediaMTX as publisher)
+                          AudioPushPipeline* push = nullptr;
                           if (g_rtsp_manager) {
-                            auto* push = g_rtsp_manager->StartAudioPush(session_id, s->rtsp_pull_url);
-                            if (push) {
-                              // Read WAV file and feed to push pipeline
-                              std::ifstream wav(item.audio_path, std::ios::binary);
-                              if (wav) {
-                                // Skip WAV header (44 bytes)
-                                wav.seekg(44);
-                                std::vector<int16_t> wav_data;
-                                int16_t sample;
-                                while (wav.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
-                                  wav_data.push_back(sample);
-                                }
-                                g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
-                                g_rtsp_manager->SignalPushEof(push);
-                              }
-                            }
+                            push = g_rtsp_manager->StartAudioPush(session_id, s->rtsp_pull_url);
                           }
 
-                          // Send tts_start to robot
+                          // Send tts_start FIRST — robot needs to start pulling before we push
                           if (g_ws_server) {
                             json tts_msg;
                             tts_msg["event"] = "tts_start";
@@ -425,6 +416,32 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                             g_ws_server->SendMessage(s->ws_fd, tts_msg.dump());
                             LOG_INFO("[TTS] tts_start sent to session {}: tts_id={}",
                                      session_id, item.tts_id);
+                          }
+
+                          // Wait for robot to start pulling, then feed audio
+                          if (push) {
+                            // Read WAV file
+                            std::ifstream wav(item.audio_path, std::ios::binary);
+                            if (wav) {
+                              wav.seekg(44);  // skip WAV header
+                              std::vector<int16_t> wav_data;
+                              int16_t sample;
+                              while (wav.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
+                                wav_data.push_back(sample);
+                              }
+                              // Wait for robot to connect its pull (robot retries may
+                              // take up to ~2s: 300+600+1200ms back-off).
+                              // Meanwhile, ffmpeg -re pushes at real-time (~6.8s)
+                              // so the robot won't miss the stream.
+                              std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+                              g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
+                              LOG_INFO("[TTS] pushed {} samples to RTSP for session {}",
+                                       wav_data.size(), session_id);
+                              // -re flag makes ffmpeg read at real-time speed.
+                              // Signal EOF now; PushLoop will drain the ring buffer
+                              // at 1x speed (~6.8s), then close ffmpeg cleanly.
+                              g_rtsp_manager->SignalPushEof(push);
+                            }
                           }
 
                           s->TransitionTo(SessionState::Playing);
@@ -668,6 +685,9 @@ int main(int argc, char* argv[]) {
       cfg.auto_launch_mediamtx = false;
     }
   }
+
+  // Make rtsp_base_url available to the WebSocket message handler
+  g_rtsp_base_url = cfg.rtsp_base_url;
 
   // Create directories
   system("mkdir -p /tmp/rtsp-server/debug");
