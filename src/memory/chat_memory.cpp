@@ -1,5 +1,5 @@
 /**
- * 对话记忆管理 — Token 感知 + O(1) 截断
+ * 对话记忆管理 — Token 感知 + O(1) 截断 + Skill 事实持久化
  */
 
 #include "memory/chat_memory.h"
@@ -14,10 +14,17 @@ ChatMemory::ChatMemory(int max_rounds, int max_tokens)
 
 void ChatMemory::add(const std::string& user_msg, const std::string& assistant_msg)
 {
-    int tokens = TokenCounter::estimate(user_msg)
-               + TokenCounter::estimate(assistant_msg);
+    add(user_msg, assistant_msg, "");
+}
 
-    history_.push_back({user_msg, assistant_msg, tokens});
+void ChatMemory::add(const std::string& user_msg, const std::string& assistant_msg,
+                     const std::string& skill_fact)
+{
+    int tokens = TokenCounter::estimate(user_msg)
+               + TokenCounter::estimate(assistant_msg)
+               + TokenCounter::estimate(skill_fact);
+
+    history_.push_back({user_msg, assistant_msg, skill_fact, tokens});
     total_tokens_ += tokens;
 
     trim();
@@ -33,10 +40,30 @@ std::string ChatMemory::get_context() const
 
     std::string result;
     for (const auto& e : history_) {
+        if (!e.skill_fact.empty()) {
+            result += "[已知信息] " + e.skill_fact + "\n";
+        }
         result += "User: " + e.user + "\n";
         result += "Assistant: " + e.assistant + "\n";
     }
     return result;
+}
+
+std::vector<ChatMessage> ChatMemory::get_messages() const
+{
+    std::vector<ChatMessage> msgs;
+    if (history_.empty()) return msgs;
+
+    for (const auto& e : history_) {
+        // 如果本轮有 skill 事实，先作为一个 system 消息注入
+        if (!e.skill_fact.empty()) {
+            msgs.push_back({"system",
+                "[已知信息] " + e.skill_fact});
+        }
+        msgs.push_back({"user", e.user});
+        msgs.push_back({"assistant", e.assistant});
+    }
+    return msgs;
 }
 
 void ChatMemory::clear()
@@ -84,9 +111,10 @@ bool ChatMemory::save_to_file(const std::string& path) const
 
     for (const auto& e : history_) {
         nlohmann::json entry;
-        entry["user"]      = e.user;
-        entry["assistant"] = e.assistant;
-        entry["tokens"]    = e.tokens;
+        entry["user"]       = e.user;
+        entry["assistant"]  = e.assistant;
+        entry["skill_fact"] = e.skill_fact;
+        entry["tokens"]     = e.tokens;
         rounds.push_back(entry);
     }
 
@@ -120,9 +148,10 @@ bool ChatMemory::load_from_file(const std::string& path)
         if (j.contains("rounds") && j["rounds"].is_array()) {
             for (const auto& entry : j["rounds"]) {
                 Entry e;
-                e.user      = entry.value("user", "");
-                e.assistant = entry.value("assistant", "");
-                e.tokens    = entry.value("tokens", 0);
+                e.user       = entry.value("user", "");
+                e.assistant  = entry.value("assistant", "");
+                e.skill_fact = entry.value("skill_fact", "");
+                e.tokens     = entry.value("tokens", 0);
                 history_.push_back(e);
                 total_tokens_ += e.tokens;
             }

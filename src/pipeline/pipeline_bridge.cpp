@@ -182,6 +182,40 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
   LOG_INFO("[Pipeline] processing text: \"{}\"", text);
 
+  // ── 0. Filter semantically empty filler words ──────────
+  // "嗯", "啊", "哦" etc. carry no intent — skip LLM to avoid
+  // free-form generation that contradicts prior context.
+  {
+    static const std::vector<std::string> kFillers = {
+      "嗯", "嗯嗯", "啊", "哦", "呃", "噢", "诶", "唔",
+      "嗯。", "嗯？", "嗯！", "嗯嗯嗯",
+      "ah", "uh", "um", "hmm", "oh", "eh",
+    };
+    std::string trimmed = text;
+    // Remove common ASCII punctuation and whitespace
+    trimmed.erase(std::remove_if(trimmed.begin(), trimmed.end(),
+        [](unsigned char c) { return c == '.' || c == '?' || c == '!'
+            || c == ',' || c == ' ' || c == '\t' || c == '\n'; }),
+        trimmed.end());
+    // Remove Chinese punctuation (multi-byte UTF-8 sequences)
+    for (const char* punct : {"。", "？", "！", "，", "…", "~"}) {
+      size_t pos;
+      while ((pos = trimmed.find(punct)) != std::string::npos) {
+        trimmed.erase(pos, strlen(punct));
+      }
+    }
+    for (const auto& f : kFillers) {
+      if (trimmed == f) {
+        LOG_INFO("[Pipeline] filler word detected \"{}\", skipping LLM", text);
+        result.asr_text = text;
+        result.llm_response = "嗯？";  // minimal acknowledgment, no free-form generation
+        result.skill_direct = true;
+        result.ok = true;
+        return result;
+      }
+    }
+  }
+
   // ── Resolve user_id for per-user isolation ──────────────
   std::string user_id;
   if (!session_id.empty()) {
@@ -249,11 +283,11 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   }
 
   // ── 2. Get conversation history ────────────────────────
-  std::string history_context;
+  std::vector<ChatMessage> history_msgs;
   if (cfg_.memory_enabled && !session_id.empty()) {
     ChatMemory* mem = GetSessionMemory(session_id, user_id);
     if (mem) {
-      history_context = mem->get_context();
+      history_msgs = mem->get_messages();
     }
   }
 
@@ -281,7 +315,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   // LLM response cache: skip LLM call for frequent static queries ("你好", etc.)
   // Only cache non-skill, non-history queries where the response is deterministic.
   // Cache key includes user_id for per-user isolation.
-  if (!sr.hit && history_context.empty() && skill_context.empty()) {
+  if (!sr.hit && history_msgs.empty() && skill_context.empty()) {
     std::string cache_text = user_id + "|||" + text;
     size_t cache_key = std::hash<std::string>{}(cache_text);
     {
@@ -296,10 +330,10 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   }
 
   if (result.llm_response.empty()) {
-    result.llm_response = CallLlmChat(system_prompt, text, history_context, skill_context);
+    result.llm_response = CallLlmChat(system_prompt, text, history_msgs, skill_context);
 
     // Cache the result for frequent static queries
-    if (!sr.hit && history_context.empty() && skill_context.empty() && !result.llm_response.empty()) {
+    if (!sr.hit && history_msgs.empty() && skill_context.empty() && !result.llm_response.empty()) {
       std::string cache_text = user_id + "|||" + text;
       size_t cache_key = std::hash<std::string>{}(cache_text);
       std::lock_guard<std::mutex> lock(llm_cache_mutex_);
@@ -324,7 +358,13 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   if (cfg_.memory_enabled && !session_id.empty()) {
     ChatMemory* mem = GetSessionMemory(session_id, user_id);
     if (mem) {
-      mem->add(text, result.llm_response);
+      // Persist skill result alongside user/assistant so future
+      // turns can see facts (e.g. weather, time) even without re-triggering the skill.
+      if (sr.hit && !sr.direct && !sr.result_text.empty()) {
+        mem->add(text, result.llm_response, sr.result_text);
+      } else {
+        mem->add(text, result.llm_response);
+      }
 
       // Auto-persist by user_id for cross-session recovery
       if (!user_id.empty() && !cfg_.memory_persist_dir.empty()) {
@@ -618,8 +658,15 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
       << "piper --model " << cfg_.tts_piper_model
       << " --output_file " << output_path;
 #else
-  // Stub mode: use external Piper or espeak-ng depending on config
-  if (cfg_.tts_backend == "piper" && !cfg_.tts_piper_model.empty()) {
+  // Stub mode: use external TTS engine depending on config
+  if (cfg_.tts_backend == "edge_tts") {
+    // Microsoft Edge TTS (neural, best Chinese quality)
+    cmd << "python3 " << cfg_.tts_edge_tts_script
+        << " --text " << std::quoted(text)
+        << " --voice " << cfg_.tts_edge_tts_voice
+        << " --output " << output_path
+        << " 2>/dev/null";
+  } else if (cfg_.tts_backend == "piper" && !cfg_.tts_piper_model.empty()) {
     if (piper_available_) {
       // Piper model sample rate (huayan = 22050)
       // Pipe through ffmpeg to resample to 16kHz for robot compatibility.
@@ -785,7 +832,7 @@ std::string PipelineBridge::CallLlm(const std::string& prompt,
 
 std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
                                          const std::string& user_text,
-                                         const std::string& history_context,
+                                         const std::vector<ChatMessage>& history_msgs,
                                          const std::string& skill_context) {
   CURL* curl = curl_easy_init();
   if (!curl) return "";
@@ -795,7 +842,7 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
   // Build messages array
   json messages = json::array();
 
-  // System message
+  // System message with personality
   messages.push_back({
       {"role", "system"},
       {"content", system_prompt}
@@ -809,11 +856,11 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
     });
   }
 
-  // History context (if any)
-  if (!history_context.empty()) {
+  // History messages — proper user/assistant alternating with embedded skill facts
+  for (const auto& msg : history_msgs) {
     messages.push_back({
-        {"role", "user"},
-        {"content", "(以下为历史对话记录)\n" + history_context + "\n请基于以上历史对话继续回复。"}
+        {"role", msg.role},
+        {"content", msg.content}
     });
   }
 

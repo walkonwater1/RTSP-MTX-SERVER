@@ -181,6 +181,8 @@ static bool LoadConfig(const std::string& path, ServerConfig& cfg) {
       cfg.pipeline.tts_rate = t.value("rate", cfg.pipeline.tts_rate);
       cfg.pipeline.tts_voice = t.value("voice", cfg.pipeline.tts_voice);
       cfg.pipeline.tts_piper_model = t.value("piper_model", cfg.pipeline.tts_piper_model);
+      cfg.pipeline.tts_edge_tts_script = t.value("edge_tts_script", cfg.pipeline.tts_edge_tts_script);
+      cfg.pipeline.tts_edge_tts_voice = t.value("edge_tts_voice", cfg.pipeline.tts_edge_tts_voice);
       cfg.pipeline.tts_cache_enabled = t.value("cache_tts", cfg.pipeline.tts_cache_enabled);
       cfg.pipeline.tts_cache_dir = t.value("cache_dir", cfg.pipeline.tts_cache_dir);
     }
@@ -335,6 +337,10 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               // Suppress ASR accumulation while TTS is playing — the mic
               // captures speaker output + ambient noise, not user speech.
               if (s->GetState() == SessionState::Playing) return;
+
+              // Keep session alive during active audio streaming — prevents
+              // premature timeout during long silent/idle periods.
+              s->Touch();
 
               std::lock_guard<std::mutex> lock(s->asr_mutex);
 
@@ -519,9 +525,15 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               std::vector<int16_t> wav_data(data_samples);
                               wav.read(reinterpret_cast<char*>(wav_data.data()),
                                        data_samples * sizeof(int16_t));
+
+                              // Append 0.5s trailing silence — prevents AAC encoder
+                              // from dropping the last few frames of actual speech.
+                              constexpr int kTrailingSilenceSamples = 16000 / 2;  // 0.5s
+                              wav_data.resize(data_samples + kTrailingSilenceSamples, 0);
+
                               g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
-                              LOG_INFO("[TTS] pushed {} samples for session {}",
-                                       wav_data.size(), session_id);
+                              LOG_INFO("[TTS] pushed {} samples (+{} silence) for session {}",
+                                       wav_data.size(), kTrailingSilenceSamples, session_id);
                             }
                             g_rtsp_manager->SignalPushEof(push);
                           }
@@ -614,6 +626,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                 size_t data_samples = (file_size - 44) / sizeof(int16_t);
                 std::vector<int16_t> wav_data(data_samples);
                 wav.read(reinterpret_cast<char*>(wav_data.data()), data_samples * sizeof(int16_t));
+                // Append trailing silence to prevent AAC frame truncation
+                constexpr int kTrailingSilenceSamples = 16000 / 2;
+                wav_data.resize(data_samples + kTrailingSilenceSamples, 0);
                 g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
                 g_rtsp_manager->SignalPushEof(push);
               }

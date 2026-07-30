@@ -44,8 +44,10 @@ struct PipelineBridgeConfig {
   int llm_timeout_sec = 30;
 
   // TTS
-  std::string tts_backend = "piper";
+  std::string tts_backend = "edge_tts";  // "edge_tts" | "piper" | "espeak"
   std::string tts_piper_model;
+  std::string tts_edge_tts_script = "scripts/edge_tts_cli.py";
+  std::string tts_edge_tts_voice = "zh-CN-XiaoxiaoNeural";
   int tts_rate = 200;
   std::string tts_voice = "cmn+f3";
   int tts_sample_rate = 16000;
@@ -71,7 +73,7 @@ struct PipelineBridgeConfig {
   // Memory
   bool memory_enabled = true;
   int memory_max_rounds = 10;
-  int memory_max_tokens = 512;
+  int memory_max_tokens = 1536;
   std::string memory_persist_dir = "/tmp/rtsp-server/memory";
 };
 
@@ -190,7 +192,7 @@ private:
                       const std::string& context = "");
   std::string CallLlmChat(const std::string& system_prompt,
                           const std::string& user_text,
-                          const std::string& history_context,
+                          const std::vector<ChatMessage>& history_msgs,
                           const std::string& skill_context = "");
   std::string EscapeJson(const std::string& s);
 

@@ -246,13 +246,13 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
   LOG_INFO("[RTSP-PULL] loop started for session {}", pipeline->session_id);
 
   int retry_count = 0;
-  constexpr int kMaxRetries = 50;
+  constexpr int kMaxRetries = 10000;  // effectively infinite (~5.5h at 2s intervals)
   constexpr int kBaseDelayMs = 500;
   constexpr int kMaxDelayMs = 5000;
   // After this many consecutive EOFs, robot is likely sleeping (no RTSP publisher).
-  // Switch to slow retry with reduced logging to avoid log spam.
+  // Use a short retry interval so recovery on wake is near-instant.
   constexpr int kFastRetryLimit = 3;
-  constexpr int kSleepRetryDelayMs = 30000;
+  constexpr int kSleepRetryDelayMs = 2000;
 
   while (!pipeline->need_exit.load() && retry_count < kMaxRetries) {
     if (!LaunchPullFfmpeg(pipeline)) {
@@ -487,7 +487,17 @@ void RtspManager::PushLoop(AudioPushPipeline* pipeline) {
       read = std::min(static_cast<unsigned int>(local_buf.size()), used);
 
       if (read == 0 && pipeline->eof_signaled) {
-        // No more data and EOF signaled → close pipe and exit
+        // No more data and EOF signaled.
+        // Flush ffmpeg's stdin and wait for it to finish encoding the
+        // last AAC frames before closing the pipe. Without this, the
+        // last ~0.5s of audio can be cut off.
+        if (pipeline->ffmpeg_pipe) {
+          fflush(pipeline->ffmpeg_pipe);
+          // Give ffmpeg time to encode + push final frames to RTSP
+          for (int i = 0; i < 40 && !pipeline->need_exit.load(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+          }
+        }
         break;
       }
       if (read == 0) continue;
