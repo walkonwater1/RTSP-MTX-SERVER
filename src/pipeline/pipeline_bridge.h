@@ -85,6 +85,11 @@ struct PipelineResult {
   std::string error;          // non-empty on failure
   bool ok = false;
   bool skill_direct = false;  // skill result, bypassed LLM
+
+  // Timing (ms) — populated by ProcessText
+  long llm_ms = 0;
+  long tts_ms = 0;
+  long total_ms = 0;
 };
 
 // --- Voice Pipeline Bridge ---

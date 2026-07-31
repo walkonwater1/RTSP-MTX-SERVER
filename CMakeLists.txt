@@ -46,6 +46,7 @@ set(SERVER_HEADERS
     src/utils/base64.h
     src/utils/logger.h
     src/utils/http_client.h
+    src/utils/feishu_notifier.h
     # Skills & memory headers
     src/brain/skill_base.h
     src/brain/skill_utils.h

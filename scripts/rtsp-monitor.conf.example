@@ -1,0 +1,28 @@
+# RTSP Server Monitor Configuration
+# Copy to ~/.rtsp-monitor.conf and fill in your values
+#
+#   cp /home/lixin/eir/lixin/rtsp-server/scripts/rtsp-monitor.conf.example ~/.rtsp-monitor.conf
+#   chmod 600 ~/.rtsp-monitor.conf
+
+# [REQUIRED] Feishu webhook URL
+# Create at: https://open.feishu.cn/app → 创建自定义机器人 → 添加机器人到群聊
+# Or: Feishu group → Settings → Bots → Add Bot → Custom Bot → get webhook URL
+FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/YOUR-TOKEN-HERE"
+
+# [OPTIONAL] Who to @mention on alerts
+# "all" = @everyone in the group
+# Or set a specific user's open_id for targeted mention
+ALERT_MENTION="all"
+
+# [OPTIONAL] Monitoring thresholds
+# CPU warning threshold (%)
+CPU_WARN_PCT=80
+
+# Memory warning threshold (MB for the rtsp-mtx-server process)
+MEM_WARN_MB=2048
+
+# Pipeline latency warning threshold (ms)
+LATENCY_WARN_MS=5000
+
+# Number of log lines to scan for activity
+LOG_LINES_LOOKBACK=200

@@ -398,6 +398,9 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
   result.asr_text = text;
   result.ok = true;
+  result.llm_ms = t_llm_ms;
+  result.tts_ms = t_tts_ms;
+  result.total_ms = t_total_ms;
   LOG_INFO("[Timing] LLM={}ms TTS={}ms TOTAL={}ms", t_llm_ms, t_tts_ms, t_total_ms);
   return result;
 }

@@ -70,5 +70,8 @@
     "max_rounds": 10,
     "max_tokens": 1536,
     "persist_dir": "/tmp/rtsp-server/memory"
+  },
+  "feishu": {
+    "webhook_url": ""
   }
 }

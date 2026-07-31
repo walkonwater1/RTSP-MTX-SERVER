@@ -82,6 +82,7 @@
 #include "server/rtsp_manager.h"
 #include "pipeline/pipeline_bridge.h"
 #include "utils/logger.h"
+#include "utils/feishu_notifier.h"
 
 using json = nlohmann::json;
 using namespace rtsp_server;
@@ -93,6 +94,7 @@ static RtspManager* g_rtsp_manager = nullptr;
 static SessionManager* g_session_mgr = nullptr;
 static PipelineBridge* g_pipeline = nullptr;
 static std::string g_rtsp_base_url = "rtsp://127.0.0.1:8554";
+static std::unique_ptr<FeishuNotifier> g_feishu;
 
 // --- Configuration ---
 struct ServerConfig {
@@ -118,6 +120,9 @@ struct ServerConfig {
   // Audio debug
   bool debug_dump_audio = false;
   std::string debug_dump_dir = "/tmp/rtsp-server/debug";
+
+  // Feishu
+  std::string feishu_webhook_url;
 };
 
 // --- Signal handler ---
@@ -221,6 +226,19 @@ static bool LoadConfig(const std::string& path, ServerConfig& cfg) {
       cfg.pipeline.memory_persist_dir = m.value("persist_dir", cfg.pipeline.memory_persist_dir);
     }
 
+    // Feishu section
+    if (j.contains("feishu")) {
+      auto& f = j["feishu"];
+      cfg.feishu_webhook_url = f.value("webhook_url", cfg.feishu_webhook_url);
+    }
+
+    // Env var override: FEISHU_WEBHOOK_URL takes precedence over config file.
+    // Keeps secrets out of git-committed config.json.
+    const char* env_url = std::getenv("FEISHU_WEBHOOK_URL");
+    if (env_url && env_url[0] != '\0') {
+      cfg.feishu_webhook_url = env_url;
+    }
+
     LOG_INFO("Config loaded from {}", path);
     return true;
   } catch (const json::exception& e) {
@@ -259,6 +277,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       }
 
       session->ws_fd = client_fd;
+
+      // Feishu: push connect event
+      if (g_feishu) g_feishu->OnConnect(user_id, client_fd);
 
       // Register session → user mapping for per-user memory isolation
       if (g_pipeline) {
@@ -428,6 +449,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
                     LOG_INFO("[ASR] recognized: \"{}\" for session {}", asr_text, session_id);
 
+                    // Feishu: push ASR result
+                    if (g_feishu) g_feishu->OnAsrResult(s->user_id, asr_text);
+
                     // Send ASR result to robot
                     if (g_ws_server) {
                       json asr_msg;
@@ -474,6 +498,13 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               std::chrono::system_clock::now().time_since_epoch()).count();
                           llm_msg["data"]["text"] = result.llm_response;
                           g_ws_server->SendMessage(s->ws_fd, llm_msg.dump());
+                        }
+
+                        // Feishu: push pipeline result with latency
+                        if (g_feishu) {
+                          g_feishu->OnPipelineResult(s->user_id, asr_text,
+                              result.llm_response, result.llm_ms,
+                              result.tts_ms, result.total_ms);
                         }
 
                         // Queue TTS
@@ -736,6 +767,9 @@ static void HandleWsDisconnect(int client_fd) {
   // Find and cleanup session
   Session* session = g_session_mgr->FindSessionByFd(client_fd);
   if (session) {
+    // Feishu: push disconnect event
+    if (g_feishu) g_feishu->OnDisconnect(session->user_id);
+
     LOG_INFO("[CONN] cleaning up session {}", session->session_id);
 
     // Stop RTSP pipelines
@@ -830,6 +864,12 @@ int main(int argc, char* argv[]) {
 
   // Make rtsp_base_url available to the WebSocket message handler
   g_rtsp_base_url = cfg.rtsp_base_url;
+
+  // Init Feishu notifier (fire-and-forget, disabled if no webhook URL)
+  if (!cfg.feishu_webhook_url.empty()) {
+    g_feishu = std::make_unique<FeishuNotifier>(cfg.feishu_webhook_url);
+    LOG_INFO("  Feishu:    webhook enabled");
+  }
 
   // Create directories
   system("mkdir -p /tmp/rtsp-server/debug");
