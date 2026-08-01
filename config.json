@@ -72,6 +72,6 @@
     "persist_dir": "/tmp/rtsp-server/memory"
   },
   "feishu": {
-    "webhook_url": ""
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/0f39aeb7-da95-42b8-b541-8e7d3ab0589f"
   }
 }
