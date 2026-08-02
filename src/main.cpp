@@ -93,7 +93,7 @@ static WsSignalingServer* g_ws_server = nullptr;
 static RtspManager* g_rtsp_manager = nullptr;
 static SessionManager* g_session_mgr = nullptr;
 static PipelineBridge* g_pipeline = nullptr;
-static std::string g_rtsp_base_url = "rtsp://127.0.0.1:8554";
+static std::string g_rtsp_base_url = "rtsp://192.168.2.110:8554";
 static std::unique_ptr<FeishuNotifier> g_feishu;
 
 // --- Configuration ---
@@ -105,7 +105,7 @@ struct ServerConfig {
   int ws_ping_interval_sec = 15;
 
   // RTSP
-  std::string rtsp_base_url = "rtsp://0.0.0.0:8554";
+  std::string rtsp_base_url = "rtsp://192.168.2.110:8554";
   int rtsp_port = 8554;
   std::string mediamtx_bin = "mediamtx";
   bool auto_launch_mediamtx = true;
@@ -370,9 +370,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
               static constexpr int kMaxBufferSamples = 16000 * 60; // 60 seconds max
               static constexpr float kSpeechRms = 0.02f;           // RMS above this = speech
-              static constexpr float kSilenceRms = 0.008f;         // RMS below this = silence
-              static constexpr int kCooldownMs = 1500;             // min interval between ASR triggers (was 3000)
-              static constexpr int kMinAudioSamples = 16000 / 2;   // min 0.5s audio (was 1s)
+              static constexpr float kSilenceRms = 0.012f;         // RMS below this = silence
+              static constexpr int kCooldownMs = 800;              // min interval between ASR triggers
+              static constexpr int kMinAudioSamples = 16000 / 2;   // min 0.5s audio
 
               int current_samples = s->asr_buffer.size() / sizeof(int16_t);
 
@@ -410,11 +410,12 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
               if (is_silence && has_speech && enough_audio && enough_silence && !s->asr_finalized && cooldown_ok) {
                 s->asr_finalized = true;
+                auto asr_trigger_tp = std::chrono::steady_clock::now();
                 LOG_INFO("[ASR] speech segment end for session {} ({} samples, rms={:.4f})",
                          session_id, current_samples, rms);
 
                 // Process ASR in a background thread to not block the audio callback
-                std::thread([session_id]() {
+                std::thread([session_id, asr_trigger_tp]() {
                   Session* s = g_session_mgr->FindSession(session_id);
                   if (!s) return;
 
@@ -425,6 +426,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       auto* pcm_ptr = reinterpret_cast<const int16_t*>(s->asr_buffer.data());
                       int pcm_count = s->asr_buffer.size() / sizeof(int16_t);
                       asr_text = g_pipeline->TranscribeAudio(pcm_ptr, pcm_count, session_id);
+                      auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - asr_trigger_tp).count();
+                      LOG_INFO("[LATENCY] ASR transcription: {}ms for session {}", asr_ms, session_id);
                     }
                     s->asr_buffer.clear();
                     s->asr_finalized = false;
@@ -507,6 +511,9 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               result.tts_ms, result.total_ms);
                         }
 
+                        LOG_INFO("[LATENCY] session={} LLM={}ms TTS={}ms total={}ms",
+                                 session_id, result.llm_ms, result.tts_ms, result.total_ms);
+
                         // Queue TTS
                         if (!result.tts_audio_path.empty()) {
                           std::lock_guard<std::mutex> tlock(s->tts_mutex);
@@ -539,7 +546,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                             // Wait for pull_ready
                             {
                               std::unique_lock<std::mutex> pr_lock(s->pull_ready_mutex);
-                              if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(2500),
+                              if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(1000),
                                   [&s] { return s->pull_ready; })) {
                                 LOG_WARN("[TTS] timeout waiting for pull_ready, pushing anyway");
                               }
@@ -559,13 +566,19 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
                               // Append 0.5s trailing silence — prevents AAC encoder
                               // from dropping the last few frames of actual speech.
-                              constexpr int kTrailingSilenceSamples = 16000 / 2;  // 0.5s
+                              constexpr int kTrailingSilenceSamples = 16000 / 5;  // 0.2s
                               wav_data.resize(data_samples + kTrailingSilenceSamples, 0);
 
                               g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
                               LOG_INFO("[TTS] pushed {} samples (+{} silence) for session {}",
                                        wav_data.size(), kTrailingSilenceSamples, session_id);
                             }
+
+                            // 保持 RTSP 推送连接 3 秒，等客户端完成拉流下载
+                            // 避免客户端还没拉就收到 404（MediaMTX 流已消失）
+                            LOG_INFO("[TTS] keeping push alive for 3s to allow client pull");
+                            std::this_thread::sleep_for(std::chrono::seconds(3));
+
                             g_rtsp_manager->SignalPushEof(push);
                           }
 
@@ -856,7 +869,7 @@ int main(int argc, char* argv[]) {
       cfg.ws_port = std::atoi(argv[++i]);
     } else if (arg == "--port-rtsp" && i + 1 < argc) {
       cfg.rtsp_port = std::atoi(argv[++i]);
-      cfg.rtsp_base_url = "rtsp://0.0.0.0:" + std::to_string(cfg.rtsp_port);
+      cfg.rtsp_base_url = "rtsp://192.168.2.110:" + std::to_string(cfg.rtsp_port);
     } else if (arg == "--no-mediamtx") {
       cfg.auto_launch_mediamtx = false;
     }
@@ -864,6 +877,7 @@ int main(int argc, char* argv[]) {
 
   // Make rtsp_base_url available to the WebSocket message handler
   g_rtsp_base_url = cfg.rtsp_base_url;
+  LOG_INFO("  RTSP base: {}", g_rtsp_base_url);
 
   // Init Feishu notifier (fire-and-forget, disabled if no webhook URL)
   if (!cfg.feishu_webhook_url.empty()) {

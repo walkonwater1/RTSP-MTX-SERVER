@@ -98,7 +98,7 @@ struct Session {
   int64_t last_asr_finalized_ms = 0;  // cooldown: prevent rapid re-trigger
   bool first_utterance = true;    // skip cooldown for first speech after wake/idle
   int silence_frames = 0;        // consecutive silent chunks (for VAD hysteresis)
-  static constexpr int kSilenceFramesThreshold = 2;  // require 2 consecutive silent chunks (~500ms)
+  static constexpr int kSilenceFramesThreshold = 1;  // require 1 silent chunk (~250ms)
 
   // WebSocket connection fd (for sending messages directly)
   int ws_fd = -1;

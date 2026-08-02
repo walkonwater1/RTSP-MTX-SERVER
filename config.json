@@ -62,7 +62,7 @@
   },
   "skills": {
     "enabled": true,
-    "function_calling_enabled": true,
+    "function_calling_enabled": false,
     "fc_model": ""
   },
   "memory": {
