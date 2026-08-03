@@ -38,7 +38,7 @@ struct PipelineBridgeConfig {
   std::string asr_model_type = "zipformer_ctc";
 
   // LLM
-  std::string llm_host = "http://localhost:11434";
+  std::string llm_host = "http://192.168.2.107:11434";   // Orin NX
   std::string llm_model = "qwen2.5:3b";
   std::string llm_system_prompt;
   int llm_timeout_sec = 30;
