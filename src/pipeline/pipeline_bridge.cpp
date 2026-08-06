@@ -615,6 +615,215 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 }
 
 // ---------------------------------------------------------------------------
+// Process Text (Streaming: Skills → LLM stream → TTS stream)
+// ---------------------------------------------------------------------------
+
+PipelineResult PipelineBridge::ProcessTextStream(
+    const std::string& text,
+    const std::string& session_id,
+    std::atomic<bool>* cancel,
+    LlmTokenCallback on_llm_token,
+    TtsAudioCallback on_tts_audio) {
+
+  PipelineResult result;
+  auto t_total_start = std::chrono::steady_clock::now();
+
+  if (!ready_.load()) {
+    result.error = "pipeline not initialized";
+    return result;
+  }
+
+  if (cancel && cancel->load()) {
+    result.error = "cancelled";
+    return result;
+  }
+
+  LOG_DEBUG("[Pipeline] streaming text: \"{}\"", text);
+
+  // ── 0. Filter filler words ──────────────────────────
+  if (text.size() <= 3) {
+    std::string trimmed = text;
+    auto p = trimmed.find_first_not_of(" \t\n\r");
+    if (p != std::string::npos) trimmed = trimmed.substr(p);
+    if (trimmed == "嗯" || trimmed == "啊" || trimmed == "哦" ||
+        trimmed == "嗯嗯" || trimmed == "啊啊" || trimmed == "哦哦" ||
+        trimmed == "嗯。") {
+      LOG_DEBUG("[Pipeline] filler word detected \"{}\", skipping LLM", text);
+
+      // Synthesize a short acknowledgement via streaming TTS
+      if (on_tts_audio) {
+        std::string filler_reply = "嗯？";
+        SynthesizeTtsStream(filler_reply, on_tts_audio, session_id);
+      }
+
+      result.asr_text = text;
+      result.llm_response = "嗯？";
+      result.ok = true;
+      auto t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t_total_start).count();
+      result.total_ms = t_total_ms;
+      return result;
+    }
+  }
+
+  // ── 1. Extract session info ─────────────────────────
+  std::string user_id;
+  {
+    std::lock_guard<std::mutex> lock(memory_mutex_);
+    auto it = session_user_map_.find(session_id);
+    if (it != session_user_map_.end()) user_id = it->second;
+  }
+
+  // ── 2. Check skills ────────────────────────────────
+  SkillResult sr;
+  if (cfg_.skills_enabled) {
+    sr = skill_mgr_.detect_and_execute(text);
+    if (sr.hit && sr.direct) {
+      // Direct skill response — synthesize via streaming TTS
+      result.llm_response = sr.result_text;
+      result.skill_direct = true;
+      result.asr_text = text;
+
+      if (cancel && cancel->load()) {
+        result.error = "cancelled before TTS (skill)";
+        return result;
+      }
+
+      if (on_tts_audio && !result.llm_response.empty()) {
+        SynthesizeTtsStream(result.llm_response, on_tts_audio, session_id);
+      }
+
+      result.ok = true;
+      auto t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t_total_start).count();
+      result.total_ms = t_total_ms;
+      return result;
+    }
+  }
+
+  // Build skill context for LLM
+  std::string skill_context;
+  if (sr.hit && !sr.direct && !sr.result_text.empty()) {
+    skill_context = sr.result_text;
+  }
+
+  // ── 3. Build system prompt ──────────────────────────
+  std::string system_prompt = cfg_.llm_system_prompt;
+  if (system_prompt.empty()) {
+    system_prompt = "你是小千，一个18岁女大学生，性格活泼开朗。回复控制在2-3句话，约50字。";
+  }
+  std::string sys_ctx = SkillManager::get_system_context();
+  if (!sys_ctx.empty()) {
+    system_prompt = system_prompt + "\n\n" + sys_ctx;
+  }
+
+  // ── 4. Get conversation history ─────────────────────
+  std::vector<ChatMessage> history_msgs;
+  if (cfg_.memory_enabled && !session_id.empty()) {
+    ChatMemory* mem = GetSessionMemory(session_id, user_id);
+    if (mem) history_msgs = mem->get_messages();
+  }
+
+  // ── 5. Streaming LLM ────────────────────────────────
+  auto t_llm_start = std::chrono::steady_clock::now();
+
+  if (cancel && cancel->load()) {
+    result.error = "cancelled before LLM";
+    return result;
+  }
+
+  result.llm_response = CallLlmChatStream(system_prompt, text, history_msgs,
+                                          skill_context, on_llm_token, cancel);
+
+  auto t_llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t_llm_start).count();
+  result.llm_ms = t_llm_ms;
+
+  if (cancel && cancel->load()) {
+    result.error = "cancelled during LLM";
+    return result;
+  }
+
+  if (result.llm_response.empty()) {
+    result.error = "LLM returned empty response";
+    LOG_WARN("[Pipeline] LLM empty response for: {}", text);
+    return result;
+  }
+
+  // ── 5.5. Strip emoji ────────────────────────────────
+  {
+    std::string filtered;
+    filtered.reserve(result.llm_response.size());
+    for (size_t i = 0; i < result.llm_response.size(); ) {
+      uint32_t cp = 0;
+      int len = 0;
+      unsigned char c = static_cast<unsigned char>(result.llm_response[i]);
+      if ((c & 0x80) == 0)      { cp = c;          len = 1; }
+      else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+      else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+      else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+      else { i++; continue; }
+
+      if (i + len > result.llm_response.size()) break;
+      for (int j = 1; j < len; j++) {
+        cp = (cp << 6) | (static_cast<unsigned char>(result.llm_response[i + j]) & 0x3F);
+      }
+
+      bool keep = true;
+      if (cp == 0x200D || cp == 0xFE0F || cp == 0xFE00) keep = false;
+      else if (cp >= 0x1F600 && cp <= 0x1F64F) keep = false;
+      else if (cp >= 0x1F300 && cp <= 0x1F5FF) keep = false;
+      else if (cp >= 0x1F680 && cp <= 0x1F6FF) keep = false;
+      else if (cp >= 0x1F1E0 && cp <= 0x1F1FF) keep = false;
+      else if (cp >= 0x1F900 && cp <= 0x1F9FF) keep = false;
+      else if (cp >= 0x1FA00 && cp <= 0x1FAFF) keep = false;
+      else if (cp >= 0x2600 && cp <= 0x27BF) keep = false;
+      else if (cp >= 0x1F3FB && cp <= 0x1F3FF) keep = false;
+      else if (cp >= 0xE000 && cp <= 0xF8FF) keep = false;
+
+      if (keep) {
+        for (int j = 0; j < len; j++) filtered += result.llm_response[i + j];
+      }
+      i += len;
+    }
+    if (filtered.size() != result.llm_response.size()) {
+      result.llm_response = std::move(filtered);
+    }
+  }
+
+  // ── 6. Update conversation memory ──────────────────
+  if (cfg_.memory_enabled && !session_id.empty()) {
+    ChatMemory* mem = GetSessionMemory(session_id, user_id);
+    if (mem) {
+      if (sr.hit && !sr.direct && !sr.result_text.empty()) {
+        mem->add(text, result.llm_response, sr.result_text);
+      } else {
+        mem->add(text, result.llm_response);
+      }
+    }
+  }
+
+  // ── 7. Streaming TTS ────────────────────────────────
+  auto t_tts_start = std::chrono::steady_clock::now();
+
+  if (on_tts_audio && !result.llm_response.empty()) {
+    SynthesizeTtsStream(result.llm_response, on_tts_audio, session_id);
+  }
+
+  auto t_tts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t_tts_start).count();
+
+  auto t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t_total_start).count();
+
+  result.asr_text = text;
+  result.ok = true;
+  result.tts_ms = t_tts_ms;
+  result.total_ms = t_total_ms;
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Process Audio (ASR → LLM → TTS)
 // ---------------------------------------------------------------------------
 
@@ -888,6 +1097,88 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
 bool PipelineBridge::SynthesizeTts(const std::string& text,
                                     const std::string& output_path,
                                     const std::string& session_id) {
+
+  // ── Remote TTS (Orin NX GPU) ──────────────────────
+  if (!cfg_.tts_remote_host.empty()) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::string url = "http://" + cfg_.tts_remote_host + "/tts";
+    nlohmann::json req_body;
+    req_body["text"] = text;
+    std::string req_str = req_body.dump();
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    // Write response to file
+    std::ofstream out(output_path, std::ios::binary);
+    if (!out) {
+      curl_slist_free_all(headers);
+      curl_easy_cleanup(curl);
+      return false;
+    }
+
+    // Use a simple lambda-capture struct for the file stream
+    struct WriteCtx {
+      std::ofstream* stream;
+    } ctx = {&out};
+
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                     +[](void* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+                       auto* ctx = static_cast<WriteCtx*>(userdata);
+                       size_t total = size * nmemb;
+                       ctx->stream->write(static_cast<char*>(ptr), total);
+                       return total;
+                     });
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    out.close();
+
+    if (res == CURLE_OK && http_code == 200) {
+      // Resample from 22050 → target sample rate if needed
+      if (cfg_.tts_sample_rate != 22050) {
+        std::string tmp_path = output_path + ".22050.wav";
+        if (std::rename(output_path.c_str(), tmp_path.c_str()) == 0) {
+          std::ostringstream ffmpeg_cmd;
+          ffmpeg_cmd << "ffmpeg -y -i " << tmp_path
+                     << " -ar " << cfg_.tts_sample_rate << " -ac 1 -sample_fmt s16"
+                     << " -loglevel error "
+                     << output_path << " 2>/dev/null";
+          int ret = system(ffmpeg_cmd.str().c_str());
+          if (ret != 0) {
+            LOG_WARN("[TTS] remote: ffmpeg resample failed, keeping original rate");
+            std::rename(tmp_path.c_str(), output_path.c_str());
+          } else {
+            std::remove(tmp_path.c_str());
+          }
+        }
+      }
+      LOG_DEBUG("[TTS] remote synthesis OK: \"{}\" → {}", text, output_path);
+      // Cache the result locally
+      if (cfg_.tts_cache_enabled) {
+        std::string cached = GetCachePath(text);
+        std::ifstream src(output_path, std::ios::binary);
+        std::ofstream dst(cached, std::ios::binary);
+        if (src && dst) { dst << src.rdbuf(); }
+      }
+      return true;
+    }
+
+    LOG_ERROR("[TTS] remote synthesis failed: curl={} http={}", (int)res, http_code);
+    return false;
+  }
+
   // Check cache
   if (cfg_.tts_cache_enabled) {
     std::string cached = GetCachePath(text);
@@ -1074,6 +1365,86 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
 
   LOG_DEBUG("[TTS] synthesized: \"{}\"", text);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// TTS Streaming (piper --output-raw → PCM chunks via callback)
+// ---------------------------------------------------------------------------
+
+bool PipelineBridge::SynthesizeTtsStream(const std::string& text,
+                                         TtsAudioCallback on_audio,
+                                         const std::string& session_id) {
+  if (!on_audio) return false;
+
+  // Check cache first — we can serve cached WAV as a single chunk
+  if (cfg_.tts_cache_enabled) {
+    std::string cached = GetCachePath(text);
+    std::ifstream check(cached, std::ios::binary);
+    if (check.good()) {
+      check.close();
+      // Read cached WAV and strip header to get raw PCM
+      std::ifstream src(cached, std::ios::binary);
+      if (src) {
+        // Skip WAV header (44 bytes)
+        src.seekg(44);
+        std::vector<int16_t> samples;
+        int16_t sample;
+        while (src.read(reinterpret_cast<char*>(&sample), sizeof(sample))) {
+          samples.push_back(sample);
+        }
+        if (!samples.empty()) {
+          on_audio(samples.data(), static_cast<int>(samples.size()), true);
+          LOG_DEBUG("[TTS] stream cache hit: \"{}\" ({} samples)", text, samples.size());
+          return true;
+        }
+      }
+    }
+  }
+
+  if (!piper_available_) {
+    LOG_WARN("[TTS] piper not available for streaming, falling back to file synthesis");
+    return false;
+  }
+
+  // Build piper command: echo text | piper --model <model> --output-raw
+  std::ostringstream cmd;
+  cmd << "echo " << std::quoted(text) << " | "
+      << "piper --model " << cfg_.tts_piper_model
+      << " --output-raw 2>/dev/null";
+
+  FILE* pipe = popen(cmd.str().c_str(), "r");
+  if (!pipe) {
+    LOG_ERROR("[TTS] piper popen failed for streaming");
+    return false;
+  }
+
+  // Read PCM chunks from piper's stdout
+  // Piper outputs raw S16LE at model's native sample rate (huayan = 22050 Hz)
+  // Chunk size: ~186ms of audio at 22050 Hz = 4096 samples = 8192 bytes
+  static constexpr int kChunkSamples = 4096;
+  std::vector<int16_t> chunk(kChunkSamples);
+
+  int total_samples = 0;
+  while (true) {
+    size_t n = fread(chunk.data(), sizeof(int16_t), kChunkSamples, pipe);
+    if (n == 0) break;
+    total_samples += static_cast<int>(n);
+    on_audio(chunk.data(), static_cast<int>(n), false);
+  }
+
+  int ret = pclose(pipe);
+  if (ret != 0) {
+    LOG_WARN("[TTS] piper stream exited with code {}", ret);
+    if (total_samples == 0) return false;
+  }
+
+  // Signal end of stream
+  on_audio(nullptr, 0, true);
+
+  LOG_DEBUG("[TTS] stream complete: \"{}\" ({} total samples, {}ms)",
+            text, total_samples,
+            total_samples * 1000 / 22050);
+  return total_samples > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,6 +1647,150 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
     LOG_ERROR("[LLM] JSON parse error: {}", e.what());
     return "";
   }
+}
+
+// ---------------------------------------------------------------------------
+// LLM Call via /api/chat (streaming — NDJSON chunks)
+// ---------------------------------------------------------------------------
+
+namespace {
+// State for streaming curl write callback — accumulates partial NDJSON lines
+struct LlmStreamState {
+  LlmTokenCallback on_token;
+  std::atomic<bool>* cancel;
+  std::string full_response;  // accumulated complete text
+  std::string buffer;         // partial line buffer
+};
+}  // namespace
+
+static size_t LlmStreamWriteCallback(void* contents, size_t size, size_t nmemb,
+                                      void* userp) {
+  auto* state = static_cast<LlmStreamState*>(userp);
+  size_t total = size * nmemb;
+
+  // Check cancellation
+  if (state->cancel && state->cancel->load()) return 0;
+
+  state->buffer.append(static_cast<char*>(contents), total);
+
+  // Process complete lines
+  size_t pos;
+  while ((pos = state->buffer.find('\n')) != std::string::npos) {
+    std::string line = state->buffer.substr(0, pos);
+    state->buffer.erase(0, pos + 1);
+
+    // Trim \r
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+
+    try {
+      auto j = nlohmann::json::parse(line);
+      bool done = j.value("done", false);
+
+      if (!done) {
+        std::string token = j.value("message", nlohmann::json::object())
+                                .value("content", "");
+        if (!token.empty()) {
+          state->full_response += token;
+          if (state->on_token) state->on_token(token, false);
+        }
+      } else {
+        if (state->on_token) state->on_token("", true);
+      }
+    } catch (const nlohmann::json::exception& e) {
+      LOG_DEBUG("[LLM] stream parse error: {} — line: {}", e.what(), line);
+    }
+  }
+
+  return total;
+}
+
+std::string PipelineBridge::CallLlmChatStream(
+    const std::string& system_prompt,
+    const std::string& user_text,
+    const std::vector<ChatMessage>& history_msgs,
+    const std::string& skill_context,
+    LlmTokenCallback on_token,
+    std::atomic<bool>* cancel) {
+
+  if (cancel && cancel->load()) return "";
+
+  CURL* curl = curl_easy_init();
+  if (!curl) return "";
+
+  std::string url = cfg_.llm_host + "/api/chat";
+
+  // Build messages array (same as CallLlmChat)
+  nlohmann::json messages = nlohmann::json::array();
+  messages.push_back({{"role", "system"}, {"content", system_prompt}});
+
+  if (!skill_context.empty()) {
+    messages.push_back({
+        {"role", "system"},
+        {"content", "[工具返回结果]\n" + skill_context +
+                    "\n\n请严格根据以上工具返回的事实信息回答用户问题，不要凭训练数据猜测。"}
+    });
+  }
+
+  for (const auto& msg : history_msgs) {
+    messages.push_back({{"role", msg.role}, {"content", msg.content}});
+  }
+  messages.push_back({{"role", "user"}, {"content", user_text}});
+
+  nlohmann::json body;
+  body["model"] = cfg_.llm_model;
+  body["messages"] = messages;
+  body["stream"] = true;                       // ← streaming!
+  body["options"]["temperature"] = 0.7;
+  body["options"]["num_predict"] = 128;
+  body["keep_alive"] = -1;
+
+  std::string body_str = body.dump();
+
+  struct curl_slist* headers = nullptr;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
+
+  // Set up streaming state
+  LlmStreamState state;
+  state.on_token = std::move(on_token);
+  state.cancel = cancel;
+
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, LlmStreamWriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
+
+  // Enable cancellation via progress callback
+  if (cancel) {
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  }
+
+  CURLcode res = curl_easy_perform(curl);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  if (res != CURLE_OK) {
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+      LOG_INFO("[LLM] stream request cancelled by interrupt");
+    } else {
+      LOG_ERROR("[LLM] stream curl error: {}", curl_easy_strerror(res));
+    }
+    return "";
+  }
+
+  // Trim response
+  auto start = state.full_response.find_first_not_of(" \t\n\r");
+  auto end = state.full_response.find_last_not_of(" \t\n\r");
+  if (start != std::string::npos) {
+    state.full_response = state.full_response.substr(start, end - start + 1);
+  }
+
+  return state.full_response;
 }
 
 // ---------------------------------------------------------------------------

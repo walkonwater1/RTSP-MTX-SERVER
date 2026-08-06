@@ -49,9 +49,12 @@ struct PipelineBridgeConfig {
   std::string llm_model = "qwen2.5:3b";
   std::string llm_system_prompt;
   int llm_timeout_sec = 30;
+  bool llm_streaming = false;
 
   // TTS
   std::string tts_backend = "edge_tts";  // "edge_tts" | "piper" | "espeak"
+  bool tts_streaming = false;
+  std::string tts_remote_host;           // e.g. "192.168.2.107:8765" for Orin NX
   std::string tts_piper_model;
   std::string tts_edge_tts_script = "scripts/edge_tts_cli.py";
   std::string tts_edge_tts_voice = "zh-CN-XiaoxiaoNeural";
@@ -83,6 +86,10 @@ struct PipelineBridgeConfig {
   int memory_max_tokens = 1536;
   std::string memory_persist_dir = "/tmp/rtsp-server/memory";
 };
+
+// --- Streaming callbacks ---
+using LlmTokenCallback = std::function<void(const std::string& token, bool is_final)>;
+using TtsAudioCallback = std::function<void(const int16_t* pcm, int sample_count, bool is_final)>;
 
 // --- Processing result ---
 struct PipelineResult {
@@ -119,6 +126,12 @@ public:
    * @brief Whether the pipeline is initialized and ready.
    */
   bool IsReady() const { return ready_.load(); }
+
+  /// Whether streaming TTS mode is enabled in config
+  bool IsStreamingTts() const { return cfg_.tts_streaming; }
+
+  /// Whether streaming LLM mode is enabled in config
+  bool IsStreamingLlm() const { return cfg_.llm_streaming; }
 
   /**
    * @brief Process text through Skill detection → LLM (with memory) → TTS.
@@ -168,6 +181,18 @@ public:
                      const std::string& output_path,
                      const std::string& session_id = "");
 
+  // ── Streaming pipeline ──────────────────────────
+
+  PipelineResult ProcessTextStream(const std::string& text,
+                                   const std::string& session_id,
+                                   std::atomic<bool>* cancel,
+                                   LlmTokenCallback on_llm_token,
+                                   TtsAudioCallback on_tts_audio);
+
+  bool SynthesizeTtsStream(const std::string& text,
+                           TtsAudioCallback on_audio,
+                           const std::string& session_id = "");
+
   /**
    * @brief Reload configuration at runtime.
    */
@@ -213,6 +238,14 @@ private:
                           const std::vector<ChatMessage>& history_msgs,
                           const std::string& skill_context = "",
                           std::atomic<bool>* cancel = nullptr);
+
+  std::string CallLlmChatStream(const std::string& system_prompt,
+                                const std::string& user_text,
+                                const std::vector<ChatMessage>& history_msgs,
+                                const std::string& skill_context,
+                                LlmTokenCallback on_token,
+                                std::atomic<bool>* cancel = nullptr);
+
   std::string EscapeJson(const std::string& s);
 
   // Cached TTS backend check (avoid forking shell every TTS call)

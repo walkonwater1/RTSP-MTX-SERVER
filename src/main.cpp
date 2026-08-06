@@ -178,12 +178,15 @@ static bool LoadConfig(const std::string& path, ServerConfig& cfg) {
       cfg.pipeline.llm_model = l.value("model", cfg.pipeline.llm_model);
       cfg.pipeline.llm_system_prompt = l.value("system_prompt", cfg.pipeline.llm_system_prompt);
       cfg.pipeline.llm_timeout_sec = l.value("timeout_sec", cfg.pipeline.llm_timeout_sec);
+      cfg.pipeline.llm_streaming = l.value("streaming", cfg.pipeline.llm_streaming);
     }
 
     // TTS section
     if (j.contains("tts")) {
       auto& t = j["tts"];
       cfg.pipeline.tts_backend = t.value("backend", cfg.pipeline.tts_backend);
+      cfg.pipeline.tts_streaming = t.value("streaming", cfg.pipeline.tts_streaming);
+      cfg.pipeline.tts_remote_host = t.value("remote_host", cfg.pipeline.tts_remote_host);
       cfg.pipeline.tts_rate = t.value("rate", cfg.pipeline.tts_rate);
       cfg.pipeline.tts_voice = t.value("voice", cfg.pipeline.tts_voice);
       cfg.pipeline.tts_piper_model = t.value("piper_model", cfg.pipeline.tts_piper_model);
@@ -584,6 +587,125 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                     // The cancel_pipeline flag is tied to the session and set by
                     // NewGeneration() when an interrupt occurs.
                     if (g_pipeline && g_pipeline->IsReady()) {
+
+                      // ── Streaming pipeline path ──────────────────
+                      if (g_pipeline->IsStreamingTts()) {
+                        std::string tts_id = s->GenerateTtsId();
+                        int total_audio_samples = 0;
+                        std::string accumulated_llm_text;
+
+                        // Build callbacks (capture by reference — thread runs synchronously)
+                        LlmTokenCallback on_llm_token = [&](const std::string& token, bool is_final) {
+                          if (!g_ws_server) return;
+                          if (s->generation_id.load() != my_generation) return;
+
+                          if (!is_final && !token.empty()) {
+                            // Send streaming LLM token
+                            json tok_msg;
+                            tok_msg["event"] = "llm_token";
+                            tok_msg["session_id"] = session_id;
+                            tok_msg["data"]["token"] = token;
+                            g_ws_server->SendMessage(s->ws_fd, tok_msg.dump());
+                          }
+                        };
+
+                        TtsAudioCallback on_tts_audio = [&](const int16_t* pcm, int sample_count,
+                                                            bool is_final) {
+                          if (!g_ws_server) return;
+                          if (s->generation_id.load() != my_generation) return;
+
+                          if (!is_final && pcm && sample_count > 0) {
+                            // Send PCM chunk as binary WebSocket frame
+                            size_t byte_len = sample_count * sizeof(int16_t);
+                            g_ws_server->SendBinary(s->ws_fd,
+                                                    reinterpret_cast<const uint8_t*>(pcm),
+                                                    byte_len);
+                            total_audio_samples += sample_count;
+                          } else if (is_final) {
+                            // Send tts_stream_end
+                            json end_msg;
+                            end_msg["event"] = "tts_stream_end";
+                            end_msg["session_id"] = session_id;
+                            end_msg["data"]["tts_id"] = tts_id;
+                            end_msg["data"]["total_samples"] = total_audio_samples;
+                            g_ws_server->SendMessage(s->ws_fd, end_msg.dump());
+                          }
+                        };
+
+                        // Send tts_stream_start before pipeline
+                        if (g_ws_server) {
+                          json start_msg;
+                          start_msg["event"] = "tts_stream_start";
+                          start_msg["session_id"] = session_id;
+                          start_msg["data"]["tts_id"] = tts_id;
+                          start_msg["data"]["sample_rate"] = 22050;  // piper huayan native rate
+                          start_msg["data"]["encoding"] = "s16le";
+                          start_msg["data"]["channels"] = 1;
+                          g_ws_server->SendMessage(s->ws_fd, start_msg.dump());
+                        }
+
+                        s->TransitionTo(SessionState::Playing);
+                        s->current_tts_id = tts_id;
+
+                        auto result = g_pipeline->ProcessTextStream(
+                            asr_text, session_id, &s->cancel_pipeline,
+                            on_llm_token, on_tts_audio);
+
+                        // Re-check session validity
+                        s = g_session_mgr->FindSession(session_id);
+                        if (!s) {
+                          LOG_DEBUG("[ASR] session {} gone after streaming pipeline", session_id);
+                          return;
+                        }
+
+                        if (s->generation_id.load() != my_generation) {
+                          LOG_DEBUG("[ASR] generation changed, discarding stream result for {}",
+                                   session_id);
+                          s->pipeline_running.store(false);
+                          return;
+                        }
+
+                        if (!result.ok && result.error.find("cancelled") != std::string::npos) {
+                          LOG_DEBUG("[ASR] streaming pipeline cancelled for {}", session_id);
+                          s->pipeline_running.store(false);
+                          return;
+                        }
+
+                        if (!result.llm_response.empty()) {
+                          if (s->generation_id.load() != my_generation) {
+                            LOG_DEBUG("[ASR] generation changed before sending stream result");
+                            s->pipeline_running.store(false);
+                            return;
+                          }
+
+                          // ── Consolidated latency ──────────
+                          int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - asr_trigger_tp).count();
+                          const char* c = total_ms < 2000 ? "\033[1;32m" :
+                                          total_ms < 4000 ? "\033[1;33m" : "\033[1;31m";
+                          LOG_INFO("\033[1;36m[Pipeline]\033[0m {} | \"{}\" | ASR={}ms LLM={}ms TTS={}ms {}TOTAL={}ms\033[0m",
+                                   session_id, result.llm_response, asr_ms, result.llm_ms,
+                                   result.tts_ms, c, total_ms);
+
+                          // Send final llm_result (full text)
+                          if (g_ws_server) {
+                            json llm_msg;
+                            llm_msg["event"] = "llm_result";
+                            llm_msg["session_id"] = s->session_id;
+                            llm_msg["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                            llm_msg["data"]["text"] = result.llm_response;
+                            g_ws_server->SendMessage(s->ws_fd, llm_msg.dump());
+                          }
+
+                          if (g_feishu) {
+                            g_feishu->OnPipelineResult(s->user_id, asr_text,
+                                result.llm_response, result.llm_ms,
+                                result.tts_ms, result.total_ms);
+                          }
+                        }
+                      } else {
+                      // ── Legacy non-streaming path ──────────────────
                       auto result = g_pipeline->ProcessText(asr_text, session_id,
                                                             &s->cancel_pipeline);
 
@@ -687,6 +809,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                           s->current_tts_id = item.tts_id;
                         }
                       }
+                      }  // end legacy path
                     }
                     s->pipeline_running.store(false);
                   }).detach();

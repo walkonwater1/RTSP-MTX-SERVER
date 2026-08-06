@@ -123,6 +123,22 @@ void WsSignalingServer::BroadcastMessage(const std::string& json_msg) {
   }
 }
 
+bool WsSignalingServer::SendBinary(int fd, const uint8_t* data, size_t len) {
+  std::lock_guard<std::mutex> lock(conn_mutex_);
+  auto it = connections_.find(fd);
+  if (it == connections_.end() || !it->second->active.load()) {
+    return false;
+  }
+
+  std::string payload(reinterpret_cast<const char*>(data), len);
+  std::string frame = BuildFrame(payload, /*text=*/false);
+  return EnqueueFrame(it->second.get(), std::move(frame));
+}
+
+bool WsSignalingServer::SendBinary(int fd, const std::vector<uint8_t>& data) {
+  return SendBinary(fd, data.data(), data.size());
+}
+
 void WsSignalingServer::CloseClient(int fd) {
   std::lock_guard<std::mutex> lock(conn_mutex_);
   auto it = connections_.find(fd);

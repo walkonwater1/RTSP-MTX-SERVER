@@ -58,7 +58,7 @@ struct WsConnection {
   // Send queue (shared between server thread and connection send thread)
   std::mutex send_mutex;
   std::deque<std::string> send_queue;
-  static constexpr size_t kMaxQueueSize = 64;
+  static constexpr size_t kMaxQueueSize = 256;
 
   // Threads
   std::thread read_thread;
@@ -126,6 +126,21 @@ public:
    * @brief Close a client connection gracefully.
    */
   void CloseClient(int fd);
+
+  /**
+   * @brief Send binary data to a specific client.
+   *        Thread-safe — enqueues a binary WebSocket frame.
+   * @param fd   client socket fd
+   * @param data pointer to binary data
+   * @param len  data length in bytes
+   * @return true if enqueued successfully
+   */
+  bool SendBinary(int fd, const uint8_t* data, size_t len);
+
+  /**
+   * @brief Send binary data via vector.
+   */
+  bool SendBinary(int fd, const std::vector<uint8_t>& data);
 
 private:
   // --- Network ---
