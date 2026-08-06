@@ -1,6 +1,8 @@
 # RTSP Voice Interaction Server
 
-全链路 RTSP + WebSocket 语音交互服务器。替代原有的 Python 信令服务 + MediaMTX 方案，整合 ASR → Skills/FC → LLM → TTS 全链路处理。
+**C++17 | WebSocket RFC 6455 + RTSP + MediaMTX | MIT License**
+
+全链路 RTSP + WebSocket 语音交互服务器。替代原有的 Python 信令服务 + MediaMTX 方案，整合 ASR → Skills/FC → LLM → TTS 全链路处理，支持飞书机器人实时通知。
 
 > 本项目基于 [speech](https://github.com/walkonwater1/speech)（ASR-LLM-TTS 语音交互原型）将服务器部分独立拆分出来，重构为 C++ 单进程 RTSP 服务器，便于机器人端部署。
 
@@ -144,7 +146,10 @@ cmake --build . -j$(nproc)
   },
   "mediamtx": {
     "binary_path": "/usr/local/bin/mediamtx",
-    "auto_launch": true
+    "auto_launch": true,
+    "rtmp_disable": true,
+    "hls_disable": true,
+    "webrtc_disable": true
   },
   "asr": {
     "model_path": "/path/to/sherpa-onnx/zipformer-ctc-zh",
@@ -184,8 +189,14 @@ cmake --build . -j$(nproc)
   "memory": {
     "enabled": true,
     "max_rounds": 10,
-    "max_tokens": 512,
+    "max_tokens": 1536,
     "persist_dir": "/tmp/rtsp-server/memory"
+  },
+  "audio": {
+    "debug_dump_dir": "/tmp/rtsp-server/debug"
+  },
+  "feishu": {
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
   }
 }
 ```
@@ -203,7 +214,10 @@ cmake --build . -j$(nproc)
 | | `fc_model` | FC 专用模型，为空则复用 `llm.model` |
 | `memory` | `max_rounds` | 对话记忆保留轮数 |
 | | `persist_dir` | 记忆持久化目录（按 user_id 分隔文件，跨重连恢复） |
+| `audio` | `debug_dump_dir` | ASR/VAD 调试音频 dump 目录 |
+| `feishu` | `webhook_url` | 飞书机器人 Webhook 地址（connect/disconnect/ASR/Pipeline 事件推送） |
 | `vad` | `energy_threshold` | 语音活动检测能量阈值 |
+| `mediamtx` | `rtmp_disable` | 禁用 RTMP/HLS/WebRTC 协议（仅保留 RTSP） |
 
 **重要**: 将 `rtsp_base_url` 设为机器人可以访问的 IP 地址（不能用 `0.0.0.0` 或 `127.0.0.1`）。
 
@@ -232,7 +246,11 @@ rtsp-server/
 ├── config.json
 ├── README.md
 ├── scripts/
-│   └── start_mediamtx.sh
+│   ├── start_mediamtx.sh                # MediaMTX 启动脚本
+│   ├── edge_tts_cli.py                  # Edge TTS CLI (替代 Piper)
+│   ├── build_and_run.sh                 # 一键编译+运行
+│   ├── monitor.sh                       # 服务监控脚本
+│   └── rtsp-monitor.conf.example        # 监控配置模板
 ├── src/
 │   ├── main.cpp                          # 入口 + 信令消息处理 + 交互引擎
 │   ├── server/
@@ -265,6 +283,7 @@ rtsp-server/
 │   └── utils/
 │       ├── base64.h                      # Base64 编解码
 │       ├── http_client.h                 # HTTP 客户端 (libcurl)
+│       ├── feishu_notifier.h             # 飞书 Webhook 通知 (connect/disconnect/ASR/Pipeline)
 │       └── logger.h                      # spdlog 封装
 └── tests/
     └── test_ws_protocol.cpp              # 协议测试
@@ -371,3 +390,33 @@ Pipeline 处理用户输入时分两条路径：
 - `chat_<user_id>.json` — 对话历史（跨重连恢复）
 
 **注意**：多个机器人使用**相同** `user_id` 连接时，它们将共享同一份长期记忆和对话历史。如需完全隔离，请为每个机器人分配不同的 `user_id`。
+
+## 飞书通知
+
+服务器支持通过飞书 Webhook 实时推送关键事件到飞书群聊，所有推送均为 fire-and-forget 非阻塞模式：
+
+| 事件 | 触发时机 | 推送内容 |
+|------|---------|---------|
+| `OnConnect` | 客户端 WebSocket 连接建立 | user_id、session_id |
+| `OnDisconnect` | 客户端断开连接 | user_id、连接时长 |
+| `OnAsrResult` | ASR 识别完成 | 识别文本、user_id |
+| `OnPipelineResult` | 管线处理完成 | LLM 延迟(ms)、TTS 延迟(ms)、总延迟(ms) |
+
+配置方式：在 `config.json` 中设置 `feishu.webhook_url` 即可启用。
+
+```json
+"feishu": {
+  "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/your-hook-id"
+}
+```
+
+推送为独立线程执行，Webhook 不可达时不会阻塞主服务。
+
+## 项目关联
+
+| 项目 | 关系 |
+|------|------|
+| [ASR-LLM-TTS](../ASR-LLM-TTS/) | **核心依赖** — 链接 voice_pipeline/speech/brain/llm/audio/memory 库，提供 ASR/LLM/TTS/Skills 能力 |
+| [GATEWAY-MULTI-AGENT](../GATEWAY-MULTI-AGENT/) | Gateway 的 interaction Runtime 可对接本服务的 WebSocket + RTSP 协议 |
+| [MIDDLEWARE](../MIDDLEWARE/) | WebSocket/RTSP/MQTT 通信协议的知识参考 |
+| [HARNESS](../HARNESS/) | 可用于本服务 C++ 模块的 AI 驱动自动化测试 |
