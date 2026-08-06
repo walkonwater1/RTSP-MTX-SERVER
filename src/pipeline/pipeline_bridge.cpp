@@ -192,7 +192,7 @@ bool PipelineBridge::Initialize() {
 
   // Cache piper availability (avoid forking shell every TTS call)
   piper_available_ = (system("which piper >/dev/null 2>&1") == 0);
-  LOG_INFO("[Pipeline] piper available: {}", piper_available_);
+  LOG_DEBUG("[Pipeline] piper available: {}", piper_available_);
 
   // Create runtime directories
   system("mkdir -p /tmp/rtsp-server/debug");
@@ -284,7 +284,7 @@ bool PipelineBridge::Initialize() {
     if (test_result.empty() || test_result.find("error") != std::string::npos) {
       LOG_WARN("[Pipeline] LLM connectivity test failed: {}", test_result);
     } else {
-      LOG_INFO("[Pipeline] LLM connectivity OK");
+      LOG_DEBUG("[Pipeline] LLM connectivity OK");
     }
 
     // Warm-up: send a tiny inference to load model into GPU memory.
@@ -322,7 +322,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
     return result;
   }
 
-  LOG_INFO("[Pipeline] processing text: \"{}\"", text);
+  LOG_DEBUG("[Pipeline] processing text: \"{}\"", text);
 
   // ── 0. Filter semantically empty filler words ──────────
   // "嗯", "啊", "哦" etc. carry no intent — skip LLM to avoid
@@ -348,7 +348,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
     }
     for (const auto& f : kFillers) {
       if (trimmed == f) {
-        LOG_INFO("[Pipeline] filler word detected \"{}\", skipping LLM", text);
+        LOG_DEBUG("[Pipeline] filler word detected \"{}\", skipping LLM", text);
         result.asr_text = text;
         result.llm_response = "嗯？";  // minimal acknowledgment, no free-form generation
         result.skill_direct = true;
@@ -391,7 +391,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
     if (sr.hit) {
       auto t_skill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - t_skill_start).count();
-      LOG_INFO("[Pipeline] skill '{}' handled request ({}ms)", sr.skill_name, t_skill_ms);
+      LOG_DEBUG("[Pipeline] skill '{}' handled request ({}ms)", sr.skill_name, t_skill_ms);
 
       if (sr.direct) {
         // Direct response: skill result IS the final reply (skip LLM)
@@ -425,7 +425,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
       }
 
       // Non-direct: inject skill result as context for LLM
-      LOG_INFO("[Pipeline] skill result injected as LLM context");
+      LOG_DEBUG("[Pipeline] skill result injected as LLM context");
       // Fall through to LLM with the skill result as extra context
     }
   }
@@ -471,7 +471,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
       auto it = llm_cache_.find(cache_key);
       if (it != llm_cache_.end()) {
         result.llm_response = it->second;
-        LOG_INFO("[Pipeline] LLM cache hit: \"{}\"", text);
+        LOG_DEBUG("[Pipeline] LLM cache hit: \"{}\"", text);
         // Fall through to TTS (skip LLM call below)
       }
     }
@@ -511,7 +511,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
     return result;
   }
 
-  LOG_INFO("[Pipeline] LLM response ({}ms): \"{}\"", t_llm_ms, result.llm_response);
+  LOG_INFO("[LLM] \"{}\" ({}ms)", result.llm_response, t_llm_ms);
 
   // ── 4.5. Strip emoji & invisible characters ─────────────
   // LLM models sometimes generate emoji, variation selectors,
@@ -554,7 +554,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
       i += len;
     }
     if (filtered.size() != result.llm_response.size()) {
-      LOG_INFO("[Pipeline] stripped {} emoji chars from LLM response",
+      LOG_DEBUG("[Pipeline] stripped {} emoji chars from LLM response",
                result.llm_response.size() - filtered.size());
       result.llm_response = std::move(filtered);
     }
@@ -613,7 +613,6 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   result.llm_ms = t_llm_ms;
   result.tts_ms = t_tts_ms;
   result.total_ms = t_total_ms;
-  LOG_INFO("[Timing] LLM={}ms TTS={}ms TOTAL={}ms", t_llm_ms, t_tts_ms, t_total_ms);
   return result;
 }
 
@@ -683,7 +682,7 @@ PipelineResult PipelineBridge::ProcessAudio(const int16_t* pcm_data,
     return result;
   }
 
-  LOG_INFO("[Pipeline] ASR result: \"{}\"", result.asr_text);
+  LOG_DEBUG("[Pipeline] ASR result: \"{}\"", result.asr_text);
 
   // 2. LLM + TTS (via ProcessText which now has skills + memory)
   auto llm_result = ProcessText(result.asr_text, session_id, cancel);
@@ -714,7 +713,7 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
   }
   double rms = std::sqrt(sum_sq / sample_count);
   if (rms < 0.005) {
-    LOG_INFO("[ASR] audio too quiet (RMS={:.4f}), skipping ASR to avoid hallucination", rms);
+    LOG_DEBUG("[ASR] audio too quiet (RMS={:.4f}), skipping", rms);
     return "";
   }
 
@@ -758,8 +757,8 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
           text = CtcDedup(text);
           auto t_asr_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::steady_clock::now() - t_asr_start).count();
-          LOG_INFO("[ASR] recognized: \"{}\" ({} samples, {:.1f}s, ASR={}ms, RMS={:.4f}) [direct C API]",
-                   text, sample_count, sample_count / 16000.0f, t_asr_total_ms, rms);
+          LOG_DEBUG("[ASR] \"{}\" ({} samples, {}ms, RMS={:.4f}) [direct C API]",
+                   text, sample_count, t_asr_total_ms, rms);
           return text;
         }
       }
@@ -849,8 +848,8 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
               text = CtcDedup(text);
               auto t_asr_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t_asr_start).count();
-              LOG_INFO("[ASR] recognized: \"{}\" ({} samples, {:.1f}s, ASR={}ms, RMS={:.4f}) [popen fallback]",
-                       text, sample_count, sample_count / 16000.0f, t_asr_total_ms, rms);
+              LOG_DEBUG("[ASR] \"{}\" ({} samples, {}ms, RMS={:.4f}) [popen]",
+                       text, sample_count, t_asr_total_ms, rms);
               return text;
             }
           }
@@ -868,7 +867,7 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
                 }
                 if (!text.empty()) {
                   text = CtcDedup(text);
-                  LOG_INFO("[ASR] recognized: \"{}\" (RMS={:.4f}) [popen fallback]", text, rms);
+                  LOG_DEBUG("[ASR] \"{}\" (RMS={:.4f}) [popen]", text, rms);
                   return text;
                 }
               }
@@ -901,7 +900,7 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
       std::ofstream dst(output_path, std::ios::binary);
       if (src && dst) {
         dst << src.rdbuf();
-        LOG_INFO("[TTS] cache hit: \"{}\"", text);
+        LOG_DEBUG("[TTS] cache hit: \"{}\"", text);
         return true;
       }
     }
@@ -940,7 +939,7 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
             if (ff_ret == 0) {
               auto t_tts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t_tts_start).count();
-              LOG_INFO("[TTS] espeak (direct) {}ms: \"{}\" → {}", t_tts_ms, text, output_path);
+              LOG_DEBUG("[TTS] espeak {}ms: \"{}\"", t_tts_ms, text);
               ok = true;
             }
           }
@@ -954,7 +953,7 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
           if (WriteWavFile(output_path, g_tts_audio, espeak_sample_rate_)) {
             auto t_tts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_tts_start).count();
-            LOG_INFO("[TTS] espeak (direct, no-resample) {}ms: \"{}\" → {}", t_tts_ms, text, output_path);
+            LOG_DEBUG("[TTS] espeak {}ms: \"{}\"", t_tts_ms, text);
             ok = true;
           }
         }
@@ -1075,7 +1074,7 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
     }
   }
 
-  LOG_INFO("[TTS] synthesized: \"{}\" → {}", text, output_path);
+  LOG_DEBUG("[TTS] synthesized: \"{}\"", text);
   return true;
 }
 
@@ -1326,7 +1325,7 @@ void PipelineBridge::RegisterSessionUser(const std::string& session_id,
                                           const std::string& user_id) {
   std::lock_guard<std::mutex> lock(memory_mutex_);
   session_user_map_[session_id] = user_id;
-  LOG_INFO("[Pipeline] registered session {} → user {}", session_id, user_id);
+  LOG_DEBUG("[Pipeline] registered session {} → user {}", session_id, user_id);
 }
 
 UserMemoryStore* PipelineBridge::GetUserMemory(const std::string& user_id) {

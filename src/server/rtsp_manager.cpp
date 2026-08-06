@@ -30,7 +30,7 @@ bool RtspManager::Configure(const std::string& mediamtx_bin,
   mediamtx_bin_ = mediamtx_bin;
   rtsp_port_ = rtsp_port;
   auto_launch_ = auto_launch;
-  LOG_INFO("[RTSP] configured: mediamtx={}, port={}, auto_launch={}",
+  LOG_DEBUG("[RTSP] configured: mediamtx={}, port={}, auto_launch={}",
            mediamtx_bin_, rtsp_port_, auto_launch_);
   return true;
 }
@@ -227,7 +227,7 @@ void RtspManager::StopAudioPull(const std::string& session_id) {
 }
 
 void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
-  LOG_INFO("[RTSP-PULL] loop started for session {}", pipeline->session_id);
+  LOG_DEBUG("[RTSP-PULL] loop started for session {}", pipeline->session_id);
 
   int retry_count = 0;
   constexpr int kMaxRetries = 10000;  // effectively infinite (~5.5h at 2s intervals)
@@ -259,7 +259,7 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
           LOG_WARN("[RTSP-PULL] read error for session {}: {}",
                    pipeline->session_id, strerror(errno));
         } else if (retry_count < kFastRetryLimit) {
-          LOG_INFO("[RTSP-PULL] ffmpeg EOF for session {} (retry {}/{})",
+          LOG_DEBUG("[RTSP-PULL] ffmpeg EOF for session {} (retry {}/{})",
                    pipeline->session_id, retry_count, kMaxRetries);
         }
         break;
@@ -285,7 +285,7 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
     int delay;
     if (retry_count <= kFastRetryLimit) {
       delay = std::min(kBaseDelayMs * (1 << std::min(retry_count, 4)), kMaxDelayMs);
-      LOG_INFO("[RTSP-PULL] reconnecting in {} ms (attempt {}/{})",
+      LOG_DEBUG("[RTSP-PULL] reconnecting in {} ms (attempt {}/{})",
                delay, retry_count, kMaxRetries);
     } else {
       delay = kSleepRetryDelayMs;
@@ -300,7 +300,7 @@ void RtspManager::PullLoop(AudioPullPipeline* pipeline) {
 
   pipeline->state.store(RtspPipelineState::Idle);
 
-  LOG_INFO("[RTSP-PULL] loop exited for session {}", pipeline->session_id);
+  LOG_DEBUG("[RTSP-PULL] loop exited for session {}", pipeline->session_id);
   if (pipeline->on_disconnect) {
     pipeline->on_disconnect(pipeline->session_id);
   }
@@ -321,7 +321,7 @@ bool RtspManager::LaunchPullFfmpeg(AudioPullPipeline* pipeline) {
       << " -loglevel warning"
       << " 2>>/tmp/rtsp-server/ffmpeg_pull.log";
 
-  LOG_INFO("[RTSP-PULL] launching: {}", cmd.str());
+  LOG_DEBUG("[RTSP-PULL] launching ffmpeg for {}", pipeline->session_id);
 
   // Block SIGINT/SIGTERM during popen
   sigset_t old_mask, block_mask;
@@ -342,7 +342,7 @@ bool RtspManager::LaunchPullFfmpeg(AudioPullPipeline* pipeline) {
   // Disable buffering for low-latency
   setvbuf(pipeline->ffmpeg_pipe, nullptr, _IONBF, 0);
 
-  LOG_INFO("[RTSP-PULL] ffmpeg launched for {}", pipeline->session_id);
+  LOG_DEBUG("[RTSP-PULL] ffmpeg launched for {}", pipeline->session_id);
   return true;
 }
 

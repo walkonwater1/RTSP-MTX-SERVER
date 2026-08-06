@@ -36,7 +36,7 @@ void UserMemoryStore::add_memory(const std::string& content,
     // 去重: 检查是否已有相同内容
     for (const auto& e : entries_) {
         if (e.content == content) {
-            LOG_INFO("[UserMemory] duplicate memory, skip: \"{}\"", content);
+            LOG_DEBUG("[UserMemory] duplicate memory, skip: \"{}\"", content);
             return;
         }
     }
@@ -59,7 +59,7 @@ void UserMemoryStore::add_memory(const std::string& content,
         store_.add(content, embedding);
     }
 
-    LOG_INFO("[UserMemory] remembered: \"{}\" (total {})", content, entries_.size());
+    LOG_DEBUG("[UserMemory] remembered: \"{}\" (total {})", content, entries_.size());
 }
 
 // ── 语义搜索 ───────────────────────────────────────
@@ -127,7 +127,7 @@ bool UserMemoryStore::remove_by_content(const std::string& content)
                 store_.add(e.content, e.embedding);
             }
         }
-        LOG_INFO("[UserMemory] deleted: \"{}\"", content);
+        LOG_DEBUG("[UserMemory] deleted: \"{}\"", content);
         return true;
     }
     return false;
@@ -204,7 +204,7 @@ bool UserMemoryStore::load_from_file(const std::string& path)
             }
         }
 
-        LOG_INFO("[UserMemory] loaded {} long-term memories from file", entries_.size());
+        LOG_DEBUG("[UserMemory] loaded {} long-term memories from file", entries_.size());
         return true;
     } catch (...) {
         LOG_WARN("[UserMemory] failed to load memory file: {}", path);

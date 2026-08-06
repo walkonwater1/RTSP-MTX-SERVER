@@ -284,7 +284,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       session->tts_type = j.value("data", json::object()).value("tts_type", "stream");
       session->qa_type = j.value("data", json::object()).value("qa_type", "llm");
       session->interrupt_type = j.value("interrupt_type", 1);
-      LOG_INFO("[MSG] session {} params: llm={}, tts={}, qa={}, interrupt={}",
+      LOG_DEBUG("[MSG] session {} params: llm={}, tts={}, qa={}, interrupt={}",
                session->session_id, session->llm_type, session->tts_type,
                session->qa_type, session->interrupt_type);
 
@@ -310,7 +310,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
       g_ws_server->SendMessage(client_fd, resp.dump());
 
-      LOG_INFO("[MSG] session {} assigned push_url={}",
+      LOG_DEBUG("[MSG] session {} assigned push_url={}",
                session->session_id, session->rtsp_push_url);
       return;
     }
@@ -495,7 +495,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               if (is_silence && has_speech && enough_audio && enough_silence && !s->asr_finalized && cooldown_ok) {
                 s->asr_finalized = true;
                 auto asr_trigger_tp = std::chrono::steady_clock::now();
-                LOG_INFO("[ASR] speech segment end for session {} ({} samples, rms={:.4f})",
+                LOG_DEBUG("[ASR] speech segment end for session {} ({} samples, rms={:.4f})",
                          session_id, current_samples, rms);
 
                 // Process ASR in a background thread to not block the audio callback.
@@ -516,6 +516,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                     s->ResetPipelineCancel();
                   }
 
+                  int64_t asr_ms = 0;
                   std::string asr_text;
                   {
                     std::lock_guard<std::mutex> lock(s->asr_mutex);
@@ -523,9 +524,8 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       auto* pcm_ptr = reinterpret_cast<const int16_t*>(s->asr_buffer.data());
                       int pcm_count = s->asr_buffer.size() / sizeof(int16_t);
                       asr_text = g_pipeline->TranscribeAudio(pcm_ptr, pcm_count, session_id);
-                      auto asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - asr_trigger_tp).count();
-                      LOG_INFO("[LATENCY] ASR transcription: {}ms for session {}", asr_ms, session_id);
                     }
                     s->asr_buffer.clear();
                     s->asr_finalized = false;
@@ -538,8 +538,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
                   // Check if interrupted during ASR
                   if (s->generation_id.load() != my_generation) {
-                    LOG_INFO("[ASR] generation changed ({}→{}), discarding ASR for session {}",
-                             my_generation, s->generation_id.load(), session_id);
+                    LOG_DEBUG("[ASR] generation changed, discarding for session {}", session_id);
                     s->pipeline_running.store(false);
                     return;
                   }
@@ -558,7 +557,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                   }
                   s->llm_triggered = true;
 
-                    LOG_INFO("[ASR] recognized: \"{}\" for session {}", asr_text, session_id);
+                    LOG_INFO("[ASR] \"{}\"", asr_text);
 
                     // Feishu: push ASR result
                     if (g_feishu) g_feishu->OnAsrResult(s->user_id, asr_text);
@@ -576,7 +575,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
                     // Check generation before expensive LLM call
                     if (s->generation_id.load() != my_generation) {
-                      LOG_INFO("[ASR] generation changed before LLM for session {}", session_id);
+                      LOG_DEBUG("[ASR] generation changed before LLM for session {}", session_id);
                       s->pipeline_running.store(false);
                       return;
                     }
@@ -592,21 +591,21 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       // while ProcessText was running.
                       s = g_session_mgr->FindSession(session_id);
                       if (!s) {
-                        LOG_INFO("[ASR] session {} gone after LLM/TTS, discarding result", session_id);
+                        LOG_DEBUG("[ASR] session {} gone after LLM/TTS", session_id);
                         return;
                       }
 
                       // Check if result is stale (new utterance started while we were processing)
                       if (s->generation_id.load() != my_generation) {
-                        LOG_INFO("[ASR] generation changed ({}→{}), discarding stale result for session {}",
-                                 my_generation, s->generation_id.load(), session_id);
+                        LOG_DEBUG("[ASR] generation changed, discarding stale result for session {}",
+                                 session_id);
                         s->pipeline_running.store(false);
                         return;
                       }
 
                       // Check if the pipeline result itself indicates cancellation
                       if (!result.ok && result.error.find("cancelled") != std::string::npos) {
-                        LOG_INFO("[ASR] pipeline cancelled for session {}", session_id);
+                        LOG_DEBUG("[ASR] pipeline cancelled for session {}", session_id);
                         s->pipeline_running.store(false);
                         return;
                       }
@@ -614,10 +613,19 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       if (!result.llm_response.empty()) {
                         // Final generation check before sending to client
                         if (s->generation_id.load() != my_generation) {
-                          LOG_INFO("[ASR] generation changed before sending results, discarding");
+                          LOG_DEBUG("[ASR] generation changed before sending, discarding");
                           s->pipeline_running.store(false);
                           return;
                         }
+
+                        // ── Consolidated latency (ASR + LLM + TTS) ──────────
+                        int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - asr_trigger_tp).count();
+                        // Color: green <2s, yellow <4s, red >=4s
+                        const char* c = total_ms < 2000 ? "\033[1;32m" :
+                                        total_ms < 4000 ? "\033[1;33m" : "\033[1;31m";
+                        LOG_INFO("\033[1;36m[Pipeline]\033[0m {} | ASR={}ms LLM={}ms TTS={}ms {}TOTAL={}ms\033[0m",
+                                 session_id, asr_ms, result.llm_ms, result.tts_ms, c, total_ms);
 
                         // Send LLM result to robot
                         if (g_ws_server) {
@@ -636,9 +644,6 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                               result.llm_response, result.llm_ms,
                               result.tts_ms, result.total_ms);
                         }
-
-                        LOG_INFO("[LATENCY] session={} LLM={}ms TTS={}ms total={}ms",
-                                 session_id, result.llm_ms, result.tts_ms, result.total_ms);
 
                         // Queue TTS — serve WAV file via HTTP download
                         if (!result.tts_audio_path.empty()) {
@@ -674,7 +679,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                             tts_msg["data"]["audio_path"] = item.audio_path;
                             tts_msg["data"]["text"] = result.llm_response;
                             g_ws_server->SendMessage(s->ws_fd, tts_msg.dump());
-                            LOG_INFO("[TTS] tts_start sent to session {}: tts_id={}, url={}",
+                            LOG_DEBUG("[TTS] tts_start sent to session {}: tts_id={}, url={}",
                                      session_id, item.tts_id, item.audio_url);
                           }
 
@@ -726,7 +731,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       }
 
       session->Touch();
-      LOG_INFO("[MSG] playback_status({}) from session {}", status, session_id);
+      LOG_DEBUG("[MSG] playback_status({}) from session {}", status, session_id);
 
       if (status == "completed") {
         // Robot finished playing TTS (or starting a new speech turn).
@@ -799,7 +804,7 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       }
 
       session->Touch();
-      LOG_INFO("[MSG] tts_state(is_playing={}, reason={}) from session {}",
+      LOG_DEBUG("[MSG] tts_state(is_playing={}, reason={}) from session {}",
                is_playing, reason, session_id);
 
       if (!is_playing && (reason == "ended" || reason == "stop_tts" ||
@@ -925,7 +930,7 @@ static void HandleWsDisconnect(int client_fd) {
     // Feishu: push disconnect event
     if (g_feishu) g_feishu->OnDisconnect(session->user_id);
 
-    LOG_INFO("[CONN] cleaning up session {}", session->session_id);
+    LOG_DEBUG("[CONN] cleaning up session {}", session->session_id);
 
     // Stop RTSP pipelines
     if (g_rtsp_manager) {

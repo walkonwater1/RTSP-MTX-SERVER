@@ -157,7 +157,7 @@ struct Session {
   bool TransitionTo(SessionState new_state) {
     SessionState old = state.exchange(new_state);
     if (old != new_state) {
-      LOG_INFO("[Session {}] state: {} → {}",
+      LOG_DEBUG("[Session {}] state: {} → {}",
                session_id, SessionStateName(old), SessionStateName(new_state));
       return true;
     }

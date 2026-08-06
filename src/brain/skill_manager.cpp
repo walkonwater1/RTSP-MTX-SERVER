@@ -119,7 +119,7 @@ SkillResult SkillManager::detect_and_execute(const std::string& user_text)
         if (s->match(user_text)) {
             std::string result = s->execute(user_text);
             if (!result.empty()) {
-                LOG_INFO("[Skill-KW] \"{}\" → keyword match {}", user_text, s->name());
+                LOG_DEBUG("[Skill-KW] \"{}\" → keyword match {}", user_text, s->name());
                 if (s->name() == "memory") memory_modified_ = true;
                 return {true, s->is_direct_response(), s->name(), result};
             }
@@ -139,7 +139,7 @@ SkillResult SkillManager::detect_and_execute(const std::string& user_text)
                 if (skill && skill->enabled()) {
                     std::string result = skill->execute(user_text, td.arguments);
                     if (!result.empty()) {
-                        LOG_INFO("[Skill-FC] \"{}\" → LLM selected {}", user_text, td.tool_name);
+                        LOG_DEBUG("[Skill-FC] \"{}\" → LLM selected {}", user_text, td.tool_name);
                         if (td.tool_name == "memory") memory_modified_ = true;
                         return {true, skill->is_direct_response(), td.tool_name, result};
                     }

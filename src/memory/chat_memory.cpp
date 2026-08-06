@@ -30,7 +30,7 @@ void ChatMemory::add(const std::string& user_msg, const std::string& assistant_m
     trim();
 
     // 可观测: 显示上下文窗口使用率
-    LOG_INFO("[Memory] {} rounds, ~{}/{} tokens ({:.0f}%)",
+    LOG_DEBUG("[Memory] {} rounds, ~{}/{} tokens ({:.0f}%)",
               size(), total_tokens_, max_tokens_, usage() * 100);
 }
 
@@ -160,7 +160,7 @@ bool ChatMemory::load_from_file(const std::string& path)
         // 加载后裁剪（如果限制变了）
         trim();
 
-        LOG_INFO("[Memory] loaded {} rounds (~{} tokens) from file",
+        LOG_DEBUG("[Memory] loaded {} rounds (~{} tokens) from file",
                   size(), total_tokens_);
         return true;
     } catch (...) {

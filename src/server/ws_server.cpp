@@ -210,7 +210,7 @@ bool WsSignalingServer::CreateListenSocket() {
 // ---------------------------------------------------------------------------
 
 void WsSignalingServer::AcceptLoop() {
-  LOG_INFO("[WS] accept loop started");
+  LOG_DEBUG("[WS] accept loop started");
 
   while (running_.load()) {
     struct pollfd pfd;
@@ -282,7 +282,7 @@ void WsSignalingServer::AcceptLoop() {
       continue;
     }
 
-    LOG_INFO("[WS] WebSocket upgrade complete for fd={}", client_fd);
+    LOG_DEBUG("[WS] WebSocket upgrade complete for fd={}", client_fd);
 
     // Clear receive timeout for long-lived connection
     {
@@ -311,13 +311,13 @@ void WsSignalingServer::AcceptLoop() {
     conn_ptr->send_thread = std::thread(&WsSignalingServer::ClientSendLoop, this, conn_ptr);
 
     connection_count_++;
-    LOG_INFO("[WS] client fd={} ready (total connections: {})",
+    LOG_DEBUG("[WS] client fd={} ready (total connections: {})",
              client_fd, connection_count_.load());
 
     if (on_connect_) on_connect_(client_fd);
   }
 
-  LOG_INFO("[WS] accept loop exited");
+  LOG_DEBUG("[WS] accept loop exited");
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +325,7 @@ void WsSignalingServer::AcceptLoop() {
 // ---------------------------------------------------------------------------
 
 void WsSignalingServer::ClientReadLoop(WsConnection* conn) {
-  LOG_INFO("[WS] read loop started for fd={}", conn->fd);
+  LOG_DEBUG("[WS] read loop started for fd={}", conn->fd);
 
   auto last_heartbeat = std::chrono::steady_clock::now();
 
@@ -400,7 +400,7 @@ void WsSignalingServer::ClientReadLoop(WsConnection* conn) {
     }
   }
 
-  LOG_INFO("[WS] read loop exited for fd={}", conn->fd);
+  LOG_DEBUG("[WS] read loop exited for fd={}", conn->fd);
 
   // Signal send thread to stop and wait for it to finish.
   // The send thread only locks conn->send_mutex, not conn_mutex_,
@@ -652,7 +652,7 @@ bool WsSignalingServer::HandleHttpFileRequest(int fd, const std::string& request
   std::vector<char> file_data(file_size);
   file.read(file_data.data(), file_size);
   bool ok = WriteAll(fd, file_data.data(), file_size, 15);
-  LOG_INFO("[WS] HTTP file served: {} ({} bytes) → fd={}", token, file_size, fd);
+  LOG_DEBUG("[WS] HTTP file served: {} ({} bytes)", token, file_size);
   return ok;
 }
 
@@ -711,7 +711,7 @@ bool WsSignalingServer::ReceiveFrame(int fd, WsFrame& frame, int max_size) {
   // Handle control frames
   if (opcode == 0x08) {
     // Close frame
-    LOG_INFO("[WS] received close frame, payload size={}", payload_len);
+    LOG_DEBUG("[WS] received close frame, payload size={}", payload_len);
     frame.is_close = true;
     frame.payload.assign(reinterpret_cast<const char*>(buf.data()), payload_len);
     return false;  // signal disconnect
