@@ -10,15 +10,13 @@
 
 namespace rtsp_server {
 
-// --- UUID-like session ID generation ---
+// --- 32-char hex session ID (matching client protocol) ---
 std::string SessionManager::GenerateSessionId() {
-  // Use a combination of counter + random for uniqueness
   session_counter_++;
 
   std::random_device rd;
   std::mt19937 gen(rd());
   std::uniform_int_distribution<> dis(0, 15);
-  std::uniform_int_distribution<> dis2(8, 11);
 
   auto now = std::chrono::system_clock::now();
   auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -30,13 +28,8 @@ std::string SessionManager::GenerateSessionId() {
   // Time-based prefix (8 hex chars)
   oss << std::setw(8) << (now_ms & 0xFFFFFFFF);
 
-  // Version 4 UUID format for remaining
-  oss << "-4";
-  for (int i = 0; i < 3; i++) oss << dis(gen);
-  oss << "-" << dis2(gen);
-  for (int i = 0; i < 3; i++) oss << dis(gen);
-  oss << "-";
-  for (int i = 0; i < 12; i++) oss << dis(gen);
+  // Remaining 24 hex chars: random
+  for (int i = 0; i < 24; i++) oss << dis(gen);
 
   return oss.str();
 }
@@ -56,16 +49,14 @@ Session* SessionManager::CreateSession(const std::string& user_id,
   session->user_id = user_id;
   session->mode = mode;
 
-  // Assign RTSP paths
-  session->rtsp_push_path = "/robot_audio/" + session->session_id;
-  session->rtsp_pull_path = "/tts_audio/" + session->session_id;
+  // Assign RTSP paths (flat format matching client protocol)
+  session->rtsp_push_path = "robot_speech_" + session->session_id;
 
   // Build full RTSP URLs: rtsp://host:port/path
   // Strip trailing slash from rtsp_base if present
   std::string base = rtsp_base;
   while (!base.empty() && base.back() == '/') base.pop_back();
-  session->rtsp_push_url = base + session->rtsp_push_path;
-  session->rtsp_pull_url = base + session->rtsp_pull_path;
+  session->rtsp_push_url = base + "/" + session->rtsp_push_path;
 
   // Timestamps
   session->created_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -75,8 +66,8 @@ Session* SessionManager::CreateSession(const std::string& user_id,
   Session* ptr = session.get();
   sessions_.push_back(std::move(session));
 
-  LOG_INFO("[SessionMgr] created session {} for user '{}', push_url={}, pull_url={}",
-           ptr->session_id, ptr->user_id, ptr->rtsp_push_url, ptr->rtsp_pull_url);
+  LOG_INFO("[SessionMgr] created session {} for user '{}', push_url={}",
+           ptr->session_id, ptr->user_id, ptr->rtsp_push_url);
 
   return ptr;
 }

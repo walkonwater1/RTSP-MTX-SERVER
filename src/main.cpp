@@ -94,6 +94,7 @@ static RtspManager* g_rtsp_manager = nullptr;
 static SessionManager* g_session_mgr = nullptr;
 static PipelineBridge* g_pipeline = nullptr;
 static std::string g_rtsp_base_url = "rtsp://192.168.2.110:8554";
+static std::string g_http_base_url = "http://192.168.2.110:8090";  // for TTS file download
 static std::unique_ptr<FeishuNotifier> g_feishu;
 
 // --- Configuration ---
@@ -278,6 +279,15 @@ static void HandleWsMessage(int client_fd, const std::string& event,
 
       session->ws_fd = client_fd;
 
+      // Store client protocol params (with defaults)
+      session->llm_type = j.value("data", json::object()).value("llm_type", "offline");
+      session->tts_type = j.value("data", json::object()).value("tts_type", "stream");
+      session->qa_type = j.value("data", json::object()).value("qa_type", "llm");
+      session->interrupt_type = j.value("interrupt_type", 1);
+      LOG_INFO("[MSG] session {} params: llm={}, tts={}, qa={}, interrupt={}",
+               session->session_id, session->llm_type, session->tts_type,
+               session->qa_type, session->interrupt_type);
+
       // Feishu: push connect event
       if (g_feishu) g_feishu->OnConnect(user_id, client_fd);
 
@@ -290,24 +300,18 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       json resp;
       resp["event"] = "stream_address";
       resp["session_id"] = session->session_id;
+      resp["protocol_version"] = "2.0";
       int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::system_clock::now().time_since_epoch()).count();
       resp["timestamp"] = now_ms;
       resp["data"]["rtsp_url"] = session->rtsp_push_url;
-      resp["data"]["rtsp_pull_url"] = session->rtsp_pull_url;
       resp["data"]["user_id"] = user_id;
       resp["data"]["mode"] = mode;
 
       g_ws_server->SendMessage(client_fd, resp.dump());
 
-      // Also store session_id on the connection
-      {
-        // We access the WsConnection via the session manager
-        // (session_id is stored on the Session, the ws_server maps fd→session indirectly)
-      }
-
-      LOG_INFO("[MSG] session {} assigned push_url={}, pull_url={}",
-               session->session_id, session->rtsp_push_url, session->rtsp_pull_url);
+      LOG_INFO("[MSG] session {} assigned push_url={}",
+               session->session_id, session->rtsp_push_url);
       return;
     }
 
@@ -330,6 +334,10 @@ static void HandleWsMessage(int client_fd, const std::string& event,
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count());
 
+      // Invalidate any in-flight pipeline from a previous wake cycle.
+      // The robot is starting fresh audio — old results must not be sent.
+      session->NewGeneration();
+
       // Reset ASR state for new wakeup — stale state from before sleep
       // would prevent recognition from working.
       {
@@ -341,7 +349,6 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       }
       session->llm_triggered = false;  // reset for new wakeup
       session->first_utterance = true;  // first speech after wake skips cooldown
-      session->pull_ready = false;  // reset pull sync state
       session->TransitionTo(SessionState::Streaming);
       session->Touch();
 
@@ -359,6 +366,15 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               // captures speaker output + ambient noise, not user speech.
               if (s->GetState() == SessionState::Playing) return;
 
+              // Post-TTS guard: discard audio for kPostTtsGuardMs after TTS ends,
+              // preventing residual speaker echo from false-triggering ASR.
+              {
+                int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                int64_t guard = s->tts_end_ms.load();
+                if (guard > 0 && (now_ms - guard) < Session::kPostTtsGuardMs) return;
+              }
+
               // Keep session alive during active audio streaming — prevents
               // premature timeout during long silent/idle periods.
               s->Touch();
@@ -369,8 +385,6 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               s->asr_buffer.append(reinterpret_cast<const char*>(pcm), n * sizeof(int16_t));
 
               static constexpr int kMaxBufferSamples = 16000 * 60; // 60 seconds max
-              static constexpr float kSpeechRms = 0.02f;           // RMS above this = speech
-              static constexpr float kSilenceRms = 0.012f;         // RMS below this = silence
               static constexpr int kCooldownMs = 800;              // min interval between ASR triggers
               static constexpr int kMinAudioSamples = 16000 / 2;   // min 0.5s audio
 
@@ -384,16 +398,86 @@ static void HandleWsMessage(int client_fd, const std::string& event,
               }
               float rms = std::sqrt(sum_sq / n);
 
+              // Adaptive VAD: track noise floor via EMA, derive speech/silence
+              // thresholds dynamically.  Clamped to minimums so quiet-room
+              // sensitivity never lets faint TTS echo through.
+              if (!s->speech_detected && rms < s->noise_baseline * 2.0f) {
+                s->noise_baseline = 0.95f * s->noise_baseline + 0.05f * rms;
+              }
+              float speech_rms  = std::max(s->noise_baseline * 3.0f, Session::kMinSpeechRms);
+              float silence_rms = std::max(s->noise_baseline * 2.0f, Session::kMinSilenceRms);
+
               // Speech detection: high energy → someone is talking
-              if (rms > kSpeechRms) {
+              if (rms > speech_rms) {
+                bool was_speech = s->speech_detected;
                 s->speech_detected = true;
                 s->silence_frames = 0;  // reset silence counter on speech
+
+                // Interrupt: new speech detected while TTS is playing
+                if (!was_speech && s->GetState() == SessionState::Playing &&
+                    s->interrupt_type == 1 && g_ws_server) {
+                  std::string tts_id;
+                  {
+                    std::lock_guard<std::mutex> tlock(s->tts_mutex);
+                    if (!s->tts_queue.empty()) {
+                      tts_id = s->tts_queue.front().tts_id;
+                    } else if (!s->current_tts_id.empty()) {
+                      tts_id = s->current_tts_id;
+                    }
+                  }
+                  if (!tts_id.empty()) {
+                    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+
+                    // Invalidate in-flight pipeline processing —
+                    // any background thread from the previous generation will
+                    // detect the generation_id change and discard its results.
+                    s->NewGeneration();
+
+                    // Protocol: stop_tts first, then interrupt
+                    json stop_msg;
+                    stop_msg["event"] = "stop_tts";
+                    stop_msg["session_id"] = session_id;
+                    stop_msg["timestamp"] = now_ms;
+                    stop_msg["data"]["tts_id"] = tts_id;
+                    stop_msg["data"]["reason"] = "valid_interrupt";
+                    g_ws_server->SendMessage(s->ws_fd, stop_msg.dump());
+
+                    json intr_msg;
+                    intr_msg["event"] = "interrupt";
+                    intr_msg["session_id"] = session_id;
+                    intr_msg["timestamp"] = now_ms;
+                    intr_msg["data"]["tts_id"] = tts_id;
+                    g_ws_server->SendMessage(s->ws_fd, intr_msg.dump());
+
+                    LOG_INFO("[INTERRUPT] session {} interrupted tts_id={}, generation={}",
+                             session_id, tts_id, s->generation_id.load());
+
+                    // Clear TTS queue
+                    {
+                      std::lock_guard<std::mutex> tlock(s->tts_mutex);
+                      s->tts_queue.clear();
+                    }
+                    s->current_tts_id.clear();
+
+                    // Reset ASR state for new utterance
+                    {
+                      std::lock_guard<std::mutex> asr_lock(s->asr_mutex);
+                      s->asr_buffer.clear();
+                      s->asr_finalized = false;
+                      s->speech_detected = false;
+                      s->silence_frames = 0;
+                    }
+                    s->llm_triggered = false;
+                    s->first_utterance = true;
+                  }
+                }
               }
 
               // End-of-speech detection: speech was detected, then silence follows.
               // Use a silence frame counter (hysteresis) to avoid premature trigger
               // on brief pauses between syllables.
-              bool is_silence = (rms < kSilenceRms);
+              bool is_silence = (rms < silence_rms);
               if (is_silence && s->speech_detected) {
                 s->silence_frames++;
               }
@@ -414,10 +498,23 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                 LOG_INFO("[ASR] speech segment end for session {} ({} samples, rms={:.4f})",
                          session_id, current_samples, rms);
 
-                // Process ASR in a background thread to not block the audio callback
+                // Process ASR in a background thread to not block the audio callback.
+                // Use generation_id to detect staleness: if a new utterance starts
+                // (interrupt, new speech) while this thread runs, its results are discarded.
                 std::thread([session_id, asr_trigger_tp]() {
                   Session* s = g_session_mgr->FindSession(session_id);
                   if (!s) return;
+
+                  // Capture the generation this work belongs to.
+                  // If generation_id changes (interrupt / new utterance), we discard results.
+                  int64_t my_generation = s->generation_id.load();
+
+                  // Mark pipeline as running and reset cancellation
+                  {
+                    std::lock_guard<std::mutex> plock(s->pipeline_mutex);
+                    s->pipeline_running.store(true);
+                    s->ResetPipelineCancel();
+                  }
 
                   std::string asr_text;
                   {
@@ -439,14 +536,24 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                         std::chrono::system_clock::now().time_since_epoch()).count();
                   }
 
+                  // Check if interrupted during ASR
+                  if (s->generation_id.load() != my_generation) {
+                    LOG_INFO("[ASR] generation changed ({}→{}), discarding ASR for session {}",
+                             my_generation, s->generation_id.load(), session_id);
+                    s->pipeline_running.store(false);
+                    return;
+                  }
+
                   if (asr_text.empty()) {
                     LOG_DEBUG("[ASR] no text recognized for session {}", session_id);
+                    s->pipeline_running.store(false);
                     return;
                   }
 
                   // Dedup: only one LLM call per conversation turn
                   if (s->llm_triggered) {
                     LOG_DEBUG("[ASR] LLM already triggered for session {}, skipping", session_id);
+                    s->pipeline_running.store(false);
                     return;
                   }
                   s->llm_triggered = true;
@@ -467,32 +574,51 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                       g_ws_server->SendMessage(s->ws_fd, asr_msg.dump());
                     }
 
-                    // Pre-start RTSP push pipeline so ffmpeg connects to MediaMTX
-                    // in parallel with the LLM call (saves ~200-500ms).
-                    AudioPushPipeline* push = nullptr;
-                    if (g_rtsp_manager) {
-                      Session* s_push = g_session_mgr->FindSession(session_id);
-                      if (s_push) {
-                        push = g_rtsp_manager->StartAudioPush(session_id,
-                            s_push->rtsp_pull_url);
-                      }
+                    // Check generation before expensive LLM call
+                    if (s->generation_id.load() != my_generation) {
+                      LOG_INFO("[ASR] generation changed before LLM for session {}", session_id);
+                      s->pipeline_running.store(false);
+                      return;
                     }
 
-                    // Run LLM → TTS (can take 1-2s — session may be removed while we wait)
+                    // Run LLM → TTS with cancellation support.
+                    // The cancel_pipeline flag is tied to the session and set by
+                    // NewGeneration() when an interrupt occurs.
                     if (g_pipeline && g_pipeline->IsReady()) {
-                      auto result = g_pipeline->ProcessText(asr_text, session_id);
+                      auto result = g_pipeline->ProcessText(asr_text, session_id,
+                                                            &s->cancel_pipeline);
 
                       // Re-check: session may have been removed by disconnect handler
-                      // while ProcessText was running.  Accessing s after this point
-                      // would be use-after-free.
+                      // while ProcessText was running.
                       s = g_session_mgr->FindSession(session_id);
                       if (!s) {
                         LOG_INFO("[ASR] session {} gone after LLM/TTS, discarding result", session_id);
-                        if (g_rtsp_manager) g_rtsp_manager->StopAudioPush(session_id);
+                        return;
+                      }
+
+                      // Check if result is stale (new utterance started while we were processing)
+                      if (s->generation_id.load() != my_generation) {
+                        LOG_INFO("[ASR] generation changed ({}→{}), discarding stale result for session {}",
+                                 my_generation, s->generation_id.load(), session_id);
+                        s->pipeline_running.store(false);
+                        return;
+                      }
+
+                      // Check if the pipeline result itself indicates cancellation
+                      if (!result.ok && result.error.find("cancelled") != std::string::npos) {
+                        LOG_INFO("[ASR] pipeline cancelled for session {}", session_id);
+                        s->pipeline_running.store(false);
                         return;
                       }
 
                       if (!result.llm_response.empty()) {
+                        // Final generation check before sending to client
+                        if (s->generation_id.load() != my_generation) {
+                          LOG_INFO("[ASR] generation changed before sending results, discarding");
+                          s->pipeline_running.store(false);
+                          return;
+                        }
+
                         // Send LLM result to robot
                         if (g_ws_server) {
                           json llm_msg;
@@ -514,19 +640,29 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                         LOG_INFO("[LATENCY] session={} LLM={}ms TTS={}ms total={}ms",
                                  session_id, result.llm_ms, result.tts_ms, result.total_ms);
 
-                        // Queue TTS
+                        // Queue TTS — serve WAV file via HTTP download
                         if (!result.tts_audio_path.empty()) {
                           std::lock_guard<std::mutex> tlock(s->tts_mutex);
                           TtsItem item;
                           item.tts_id = s->GenerateTtsId();
                           item.text = result.llm_response;
-                          item.audio_url = s->rtsp_pull_url;
                           item.audio_path = result.tts_audio_path;
+
+                          // Build HTTP download URL from audio_path basename
+                          // File: /dev/shm/rtsp-server/tts_<sid>_<ts>.wav
+                          // Token: tts_<sid>_<ts> (filename without .wav)
+                          std::string fname = item.audio_path;
+                          auto last_slash = fname.find_last_of('/');
+                          if (last_slash != std::string::npos) fname = fname.substr(last_slash + 1);
+                          if (fname.size() > 4 && fname.substr(fname.size() - 4) == ".wav") {
+                            fname = fname.substr(0, fname.size() - 4);
+                          }
+                          item.audio_url = g_http_base_url + "/file?token=" + fname;
                           item.created_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::system_clock::now().time_since_epoch()).count();
                           s->tts_queue.push_back(item);
 
-                          // Send tts_start FIRST — robot needs to start pulling before we push
+                          // Send tts_start with HTTP download URL
                           if (g_ws_server) {
                             json tts_msg;
                             tts_msg["event"] = "tts_start";
@@ -534,69 +670,20 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                             tts_msg["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch()).count();
                             tts_msg["data"]["tts_id"] = item.tts_id;
-                            tts_msg["data"]["audio_url"] = s->rtsp_pull_url;
+                            tts_msg["data"]["audio_url"] = item.audio_url;
+                            tts_msg["data"]["audio_path"] = item.audio_path;
                             tts_msg["data"]["text"] = result.llm_response;
                             g_ws_server->SendMessage(s->ws_fd, tts_msg.dump());
-                            LOG_INFO("[TTS] tts_start sent to session {}: tts_id={}",
-                                     session_id, item.tts_id);
-                          }
-
-                          // Wait for robot to start pulling, then feed audio
-                          if (push) {
-                            // Wait for pull_ready
-                            {
-                              std::unique_lock<std::mutex> pr_lock(s->pull_ready_mutex);
-                              if (!s->pull_ready_cv.wait_for(pr_lock, std::chrono::milliseconds(1000),
-                                  [&s] { return s->pull_ready; })) {
-                                LOG_WARN("[TTS] timeout waiting for pull_ready, pushing anyway");
-                              }
-                              s->pull_ready = false;
-                            }
-
-                            // Read and push WAV data
-                            std::ifstream wav(item.audio_path, std::ios::binary);
-                            if (wav) {
-                              wav.seekg(0, std::ios::end);
-                              size_t file_size = wav.tellg();
-                              wav.seekg(44);
-                              size_t data_samples = (file_size - 44) / sizeof(int16_t);
-                              std::vector<int16_t> wav_data(data_samples);
-                              wav.read(reinterpret_cast<char*>(wav_data.data()),
-                                       data_samples * sizeof(int16_t));
-
-                              // Append 0.5s trailing silence — prevents AAC encoder
-                              // from dropping the last few frames of actual speech.
-                              constexpr int kTrailingSilenceSamples = 16000 / 5;  // 0.2s
-                              wav_data.resize(data_samples + kTrailingSilenceSamples, 0);
-
-                              g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
-                              LOG_INFO("[TTS] pushed {} samples (+{} silence) for session {}",
-                                       wav_data.size(), kTrailingSilenceSamples, session_id);
-                            }
-
-                            // 保持 RTSP 推送连接 3 秒，等客户端完成拉流下载
-                            // 避免客户端还没拉就收到 404（MediaMTX 流已消失）
-                            LOG_INFO("[TTS] keeping push alive for 3s to allow client pull");
-                            std::this_thread::sleep_for(std::chrono::seconds(3));
-
-                            g_rtsp_manager->SignalPushEof(push);
+                            LOG_INFO("[TTS] tts_start sent to session {}: tts_id={}, url={}",
+                                     session_id, item.tts_id, item.audio_url);
                           }
 
                           s->TransitionTo(SessionState::Playing);
                           s->current_tts_id = item.tts_id;
                         }
-                      } else {
-                        // LLM returned empty or TTS failed — clean up pre-started push
-                        if (push && g_rtsp_manager) {
-                          g_rtsp_manager->StopAudioPush(session_id);
-                        }
-                      }
-                    } else {
-                      // No pipeline or not ready — clean up push
-                      if (push && g_rtsp_manager) {
-                        g_rtsp_manager->StopAudioPush(session_id);
                       }
                     }
+                    s->pipeline_running.store(false);
                   }).detach();
                 }
 
@@ -611,13 +698,17 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       }
 
       // Send stream_ready response
+      int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      int64_t latency_ms = now_ms - session->push_started_ms.load();
       json ready;
       ready["event"] = "stream_ready";
       ready["session_id"] = session_id;
-      ready["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count();
-      ready["data"]["server_received"] = true;
-      ready["receive_aduio_stream"] = session_id;  // typo from old protocol
+      ready["timestamp"] = now_ms;
+      ready["data"]["rtsp_url"] = session->rtsp_push_url;
+      ready["data"]["server_received"] = now_ms;
+      ready["data"]["latency_ms"] = latency_ms;
+      ready["receive_aduio_stream"] = session_id;  // legacy typo from old protocol
       g_ws_server->SendMessage(client_fd, ready.dump());
 
       return;
@@ -638,18 +729,27 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       LOG_INFO("[MSG] playback_status({}) from session {}", status, session_id);
 
       if (status == "completed") {
-        // Robot finished playing TTS → resume ASR
+        // Robot finished playing TTS (or starting a new speech turn).
+        // Always reset these flags — the client sends this message both at
+        // TTS-end and at speech-start (handle_speech_start), and both are
+        // valid "new turn" signals.
         session->llm_triggered = false;  // re-arm for next speech turn
         session->first_utterance = true;  // first speech after TTS skips cooldown
+
+        // Guard period: only set when TTS was actually playing.
+        // The speech-start path (handle_speech_start) sends "completed"
+        // while already in Streaming — we must NOT start a guard then,
+        // or the first 500ms of real user speech is discarded.
+        if (session->GetState() == SessionState::Playing) {
+          session->tts_end_ms.store(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count());
+        }
+
         session->TransitionTo(SessionState::Streaming);
         session->current_tts_id.clear();
 
-        // Clean up push pipeline
-        if (g_rtsp_manager) {
-          g_rtsp_manager->StopAudioPush(session_id);
-        }
-
-        // Process next TTS in queue
+        // Process next TTS in queue (HTTP download, no RTSP push needed)
         std::lock_guard<std::mutex> tlock(session->tts_mutex);
         if (!session->tts_queue.empty()) {
           session->tts_queue.pop_front();
@@ -658,35 +758,15 @@ static void HandleWsMessage(int client_fd, const std::string& event,
           auto& next = session->tts_queue.front();
           session->current_tts_id = next.tts_id;
 
-          // Push next TTS audio
-          if (g_rtsp_manager) {
-            auto* push = g_rtsp_manager->StartAudioPush(session_id, session->rtsp_pull_url);
-            if (push) {
-              std::ifstream wav(next.audio_path, std::ios::binary);
-              if (wav) {
-                wav.seekg(0, std::ios::end);
-                size_t file_size = wav.tellg();
-                wav.seekg(44);
-                size_t data_samples = (file_size - 44) / sizeof(int16_t);
-                std::vector<int16_t> wav_data(data_samples);
-                wav.read(reinterpret_cast<char*>(wav_data.data()), data_samples * sizeof(int16_t));
-                // Append trailing silence to prevent AAC frame truncation
-                constexpr int kTrailingSilenceSamples = 16000 / 2;
-                wav_data.resize(data_samples + kTrailingSilenceSamples, 0);
-                g_rtsp_manager->FeedPushPcm(push, wav_data.data(), wav_data.size());
-                g_rtsp_manager->SignalPushEof(push);
-              }
-            }
-          }
-
-          // Send next tts_start
+          // Send next tts_start with HTTP download URL
           json tts_msg;
           tts_msg["event"] = "tts_start";
           tts_msg["session_id"] = session_id;
           tts_msg["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count();
           tts_msg["data"]["tts_id"] = next.tts_id;
-          tts_msg["data"]["audio_url"] = session->rtsp_pull_url;
+          tts_msg["data"]["audio_url"] = next.audio_url;
+          tts_msg["data"]["audio_path"] = next.audio_path;
           tts_msg["data"]["text"] = next.text;
           g_ws_server->SendMessage(client_fd, tts_msg.dump());
 
@@ -700,12 +780,6 @@ static void HandleWsMessage(int client_fd, const std::string& event,
           session->speech_detected = false;
           session->asr_finalized = false;
         }
-        // Signal pull_ready: robot has confirmed pull stream connection
-        {
-          std::lock_guard<std::mutex> pr_lock(session->pull_ready_mutex);
-          session->pull_ready = true;
-        }
-        session->pull_ready_cv.notify_one();
         session->TransitionTo(SessionState::Playing);
       }
 
@@ -728,15 +802,6 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       LOG_INFO("[MSG] tts_state(is_playing={}, reason={}) from session {}",
                is_playing, reason, session_id);
 
-      if (is_playing) {
-        // Robot confirmed TTS is playing → pull stream is connected
-        {
-          std::lock_guard<std::mutex> pr_lock(session->pull_ready_mutex);
-          session->pull_ready = true;
-        }
-        session->pull_ready_cv.notify_one();
-      }
-
       if (!is_playing && (reason == "ended" || reason == "stop_tts" ||
                           reason == "interrupt" || reason == "client_stop")) {
         session->llm_triggered = false;  // re-arm for next speech turn
@@ -755,6 +820,83 @@ static void HandleWsMessage(int client_fd, const std::string& event,
       if (session) {
         session->Touch();
       }
+      return;
+    }
+
+    // --- interrupt: client requests server to cancel current processing ---
+    if (event == "interrupt" || event == "cancel_pipeline" ||
+        event == "stop_generation") {
+      std::string session_id = j.value("session_id", "");
+      Session* session = g_session_mgr->FindSession(session_id);
+      if (!session) {
+        LOG_WARN("[MSG] {} for unknown session {}", event, session_id);
+        return;
+      }
+
+      session->Touch();
+      LOG_INFO("[MSG] {} from session {} — cancelling pipeline", event, session_id);
+
+      // Invalidate current generation — any in-flight background thread will
+      // see the generation_id mismatch and discard its results.
+      session->NewGeneration();
+
+      // Clear TTS queue
+      {
+        std::lock_guard<std::mutex> tlock(session->tts_mutex);
+        session->tts_queue.clear();
+      }
+      session->current_tts_id.clear();
+
+      // Reset ASR state
+      {
+        std::lock_guard<std::mutex> asr_lock(session->asr_mutex);
+        session->asr_buffer.clear();
+        session->asr_finalized = false;
+        session->speech_detected = false;
+        session->silence_frames = 0;
+      }
+      session->llm_triggered = false;
+      session->first_utterance = true;
+
+      // Acknowledge the interrupt
+      int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      json ack;
+      ack["event"] = "interrupt_ack";
+      ack["session_id"] = session_id;
+      ack["timestamp"] = now_ms;
+      g_ws_server->SendMessage(client_fd, ack.dump());
+
+      return;
+    }
+
+    // --- stop_tts: client requests server to stop TTS playback ---
+    if (event == "stop_tts") {
+      std::string session_id = j.value("session_id", "");
+      Session* session = g_session_mgr->FindSession(session_id);
+      if (!session) {
+        LOG_WARN("[MSG] stop_tts for unknown session {}", session_id);
+        return;
+      }
+
+      session->Touch();
+      LOG_INFO("[MSG] stop_tts from session {}", session_id);
+
+      // Cancel any in-flight generation
+      session->NewGeneration();
+
+      // Clear TTS queue
+      {
+        std::lock_guard<std::mutex> tlock(session->tts_mutex);
+        session->tts_queue.clear();
+      }
+      session->current_tts_id.clear();
+
+      // Reset for new speech turn
+      session->llm_triggered = false;
+      session->first_utterance = true;
+      session->TransitionTo(SessionState::Streaming);
+
       return;
     }
 
@@ -788,7 +930,6 @@ static void HandleWsDisconnect(int client_fd) {
     // Stop RTSP pipelines
     if (g_rtsp_manager) {
       g_rtsp_manager->StopAudioPull(session->session_id);
-      g_rtsp_manager->StopAudioPush(session->session_id);
     }
 
     g_session_mgr->RemoveSession(session->session_id);
@@ -810,7 +951,6 @@ static void SessionCleanupLoop(ServerConfig& cfg) {
     for (const auto& sid : expired_ids) {
       if (g_rtsp_manager) {
         g_rtsp_manager->StopAudioPull(sid);
-        g_rtsp_manager->StopAudioPush(sid);
       }
       g_session_mgr->RemoveSession(sid);
     }
@@ -877,7 +1017,18 @@ int main(int argc, char* argv[]) {
 
   // Make rtsp_base_url available to the WebSocket message handler
   g_rtsp_base_url = cfg.rtsp_base_url;
+  // Build HTTP base URL from rtsp_base_url (same host, WS port)
+  {
+    // Extract host from rtsp://host:port → http://host:ws_port
+    std::string host = cfg.rtsp_base_url;
+    auto scheme_end = host.find("://");
+    if (scheme_end != std::string::npos) host = host.substr(scheme_end + 3);
+    auto port_pos = host.find(':');
+    if (port_pos != std::string::npos) host = host.substr(0, port_pos);
+    g_http_base_url = "http://" + host + ":" + std::to_string(cfg.ws_port);
+  }
   LOG_INFO("  RTSP base: {}", g_rtsp_base_url);
+  LOG_INFO("  HTTP base: {}", g_http_base_url);
 
   // Init Feishu notifier (fire-and-forget, disabled if no webhook URL)
   if (!cfg.feishu_webhook_url.empty()) {

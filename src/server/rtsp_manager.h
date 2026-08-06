@@ -21,7 +21,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -45,7 +44,6 @@ enum class RtspPipelineState {
 struct AudioPullPipeline {
   std::string session_id;
   std::string rtsp_url;
-  std::string pcm_pipe_path;   // named pipe path for reading decoded PCM
   std::atomic<RtspPipelineState> state{RtspPipelineState::Idle};
   std::atomic<bool> need_exit{false};
 
@@ -59,28 +57,6 @@ struct AudioPullPipeline {
 
   // Callback when ffmpeg exits
   std::function<void(const std::string& session_id)> on_disconnect;
-};
-
-// --- Audio push pipeline (server pushes TTS to RTSP) ---
-struct AudioPushPipeline {
-  std::string session_id;
-  std::string rtsp_url;
-  std::atomic<RtspPipelineState> state{RtspPipelineState::Idle};
-  std::atomic<bool> need_exit{false};
-
-  FILE* ffmpeg_pipe = nullptr; // popen("w") handle
-  std::thread push_thread;
-  std::mutex mutex;
-
-  // Ring buffer for PCM data to push
-  static constexpr unsigned int kBufferCapacity = 256 * 1024; // ~16s @ 16kHz
-  std::vector<int16_t> pcm_buf;
-  unsigned int write_pos = 0;
-  unsigned int read_pos = 0;
-  std::mutex buf_mutex;
-  std::condition_variable buf_cv;
-
-  bool eof_signaled = false;  // set when caller signals end of stream
 };
 
 // --- RTSP Manager ---
@@ -134,33 +110,6 @@ public:
    */
   void StopAudioPull(const std::string& session_id);
 
-  /**
-   * @brief Start pushing audio to an RTSP path (TTS audio → RTSP).
-   * @param session_id   session identifier
-   * @param rtsp_url     full RTSP URL to push to
-   * @return pointer to the push pipeline (for FeedPcm)
-   */
-  AudioPushPipeline* StartAudioPush(const std::string& session_id,
-                                    const std::string& rtsp_url);
-
-  /**
-   * @brief Stop pushing audio for a session.
-   */
-  void StopAudioPush(const std::string& session_id);
-
-  /**
-   * @brief Feed PCM data to an existing push pipeline.
-   * @return number of samples written (may be less than count if buffer full)
-   */
-  unsigned int FeedPushPcm(AudioPushPipeline* pipeline,
-                           const int16_t* samples,
-                           unsigned int count);
-
-  /**
-   * @brief Signal end-of-stream for a push pipeline.
-   */
-  void SignalPushEof(AudioPushPipeline* pipeline);
-
 private:
   // MediaMTX subprocess
   bool LaunchMediaMtx();
@@ -170,10 +119,6 @@ private:
   static void PullLoop(AudioPullPipeline* pipeline);
   static bool LaunchPullFfmpeg(AudioPullPipeline* pipeline);
 
-  // Push pipeline internals
-  static void PushLoop(AudioPushPipeline* pipeline);
-  static bool LaunchPushFfmpeg(AudioPushPipeline* pipeline);
-
   std::string mediamtx_bin_;
   int rtsp_port_ = 8554;
   bool auto_launch_ = false;
@@ -182,7 +127,6 @@ private:
 
   std::mutex pipelines_mutex_;
   std::vector<std::unique_ptr<AudioPullPipeline>> pull_pipelines_;
-  std::vector<std::unique_ptr<AudioPushPipeline>> push_pipelines_;
   std::atomic<bool> stopped_{false};
 };
 

@@ -67,10 +67,14 @@ struct Session {
   std::string mode;  // "voice" (speech interaction)
 
   // RTSP
-  std::string rtsp_push_path;  // e.g. "/robot_audio/<session_id>"
-  std::string rtsp_pull_path;  // e.g. "/tts_audio/<session_id>"
-  std::string rtsp_push_url;   // full RTSP URL for push
-  std::string rtsp_pull_url;   // full RTSP URL for pull
+  std::string rtsp_push_path;  // e.g. "robot_speech_<session_id>"
+  std::string rtsp_push_url;   // full RTSP URL for push (client pushes mic here)
+
+  // Client protocol params (from req_stream)
+  std::string llm_type = "offline";     // stream/offline
+  std::string tts_type = "stream";      // stream/offline
+  std::string qa_type = "llm";          // faq/llm
+  int interrupt_type = 1;               // 0=disabled, 1=enabled
 
   // State
   std::atomic<SessionState> state{SessionState::Idle};
@@ -84,11 +88,6 @@ struct Session {
   std::string current_tts_id;  // currently playing (or awaiting playback)
   int tts_seq = 0;             // auto-increment for tts_id generation
 
-  // TTS push synchronization (replaces 2500ms hardcoded sleep)
-  std::mutex pull_ready_mutex;
-  std::condition_variable pull_ready_cv;
-  bool pull_ready = false;  // robot confirmed pull stream connection
-
   // ASR accumulation
   std::mutex asr_mutex;
   std::string asr_buffer;          // accumulated raw PCM audio
@@ -98,7 +97,46 @@ struct Session {
   int64_t last_asr_finalized_ms = 0;  // cooldown: prevent rapid re-trigger
   bool first_utterance = true;    // skip cooldown for first speech after wake/idle
   int silence_frames = 0;        // consecutive silent chunks (for VAD hysteresis)
-  static constexpr int kSilenceFramesThreshold = 1;  // require 1 silent chunk (~250ms)
+  static constexpr int kSilenceFramesThreshold = 3;  // ~750ms silence before end-of-utterance
+
+  // Post-TTS guard: discard audio briefly after TTS playback ends,
+  // preventing residual speaker echo / room reverb from false-triggering ASR.
+  std::atomic<int64_t> tts_end_ms{0};
+  static constexpr int kPostTtsGuardMs = 500;
+
+  // ── Interrupt / Cancellation support ─────────────────
+  // Monotonic generation counter. Incremented on each new utterance;
+  // background processing threads check this to detect staleness.
+  std::atomic<int64_t> generation_id{0};
+
+  // Set by interrupt handler to cancel in-flight LLM + TTS processing.
+  // Checked by CURL progress callback and before TTS synthesis.
+  std::atomic<bool> cancel_pipeline{false};
+
+  // True while a background ASR→LLM→TTS thread is running for this session.
+  std::atomic<bool> pipeline_running{false};
+
+  // Mutex serializes pipeline start/cancel operations.
+  std::mutex pipeline_mutex;
+
+  /// Signal that a new utterance has started — invalidates any in-flight
+  /// processing from the previous generation.
+  /// @return the new generation_id
+  int64_t NewGeneration() {
+    cancel_pipeline.store(true);
+    int64_t g = generation_id.fetch_add(1) + 1;
+    return g;
+  }
+
+  /// Reset cancellation for a new pipeline run.
+  void ResetPipelineCancel() {
+    cancel_pipeline.store(false);
+  }
+
+  // Adaptive VAD: EMA-tracked noise baseline for dynamic thresholds.
+  float noise_baseline = 0.01f;
+  static constexpr float kMinSpeechRms = 0.008f;
+  static constexpr float kMinSilenceRms = 0.004f;
 
   // WebSocket connection fd (for sending messages directly)
   int ws_fd = -1;

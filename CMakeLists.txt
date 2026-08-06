@@ -72,15 +72,57 @@ add_executable(rtsp-mtx-server ${SERVER_SOURCES} ${SERVER_HEADERS})
 
 target_include_directories(rtsp-mtx-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/speech
     ${PIPELINE_SRC_DIR}
     ${PIPELINE_SRC_DIR}/third_party/sherpa-onnx/include
 )
+
+# sherpa-onnx C API (ASR)
+set(SHERPA_ONNX_DIR "${PIPELINE_SRC_DIR}/third_party/sherpa-onnx")
+if(EXISTS "${SHERPA_ONNX_DIR}/lib/libsherpa-onnx-c-api.so")
+    target_compile_definitions(rtsp-mtx-server PRIVATE SHERPA_ONNX_AVAILABLE=1)
+    target_link_directories(rtsp-mtx-server PRIVATE "${SHERPA_ONNX_DIR}/lib")
+    message(STATUS "sherpa-onnx C API found — using direct library calls for ASR")
+else()
+    message(STATUS "sherpa-onnx C API not found — falling back to popen() for ASR")
+endif()
+
+# espeak-ng direct library (TTS)
+# The dev package may not be installed, so try the versioned .so first
+find_library(ESPEAK_NG_LIB espeak-ng PATHS /usr/lib/x86_64-linux-gnu /usr/lib NO_DEFAULT_PATH)
+if(NOT ESPEAK_NG_LIB)
+  find_library(ESPEAK_NG_LIB espeak-ng)
+endif()
+# Fallback: check for versioned .so explicitly
+if(NOT ESPEAK_NG_LIB AND EXISTS "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1")
+  set(ESPEAK_NG_LIB "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1")
+endif()
+if(ESPEAK_NG_LIB)
+    target_compile_definitions(rtsp-mtx-server PRIVATE ESPEAK_NG_AVAILABLE=1)
+    message(STATUS "espeak-ng found at ${ESPEAK_NG_LIB} — using direct library calls for TTS")
+else()
+    set(ESPEAK_NG_LIB "")
+    message(STATUS "espeak-ng not found — falling back to system() for TTS")
+endif()
+
+# Conditionally link sherpa-onnx
+if(EXISTS "${SHERPA_ONNX_DIR}/lib/libsherpa-onnx-c-api.so")
+    set(SHERPA_ONNX_LIBS
+        "${SHERPA_ONNX_DIR}/lib/libsherpa-onnx-c-api.so"
+        "${SHERPA_ONNX_DIR}/lib/libonnxruntime.so"
+    )
+else()
+    set(SHERPA_ONNX_LIBS "")
+endif()
 
 target_link_libraries(rtsp-mtx-server PRIVATE
     nlohmann_json::nlohmann_json
     spdlog::spdlog
     CURL::libcurl
     pthread
+    ${ESPEAK_NG_LIB}
+    ${SHERPA_ONNX_LIBS}
+    dl
 )
 
 # Optionally link against the ASR-LLM-TTS pipeline library if built

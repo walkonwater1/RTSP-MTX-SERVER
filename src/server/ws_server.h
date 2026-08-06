@@ -75,6 +75,10 @@ struct WsServerConfig {
   int io_timeout_sec = 5;
   int max_connections = 64;
   int max_message_size = 256 * 1024;    // 256 KB
+
+  // HTTP file serving (for TTS audio download)
+  bool enable_http_files = true;
+  std::string http_file_dir = "/dev/shm/rtsp-server";
 };
 
 // --- Callback types ---
@@ -130,8 +134,13 @@ private:
   void ClientReadLoop(WsConnection* conn);
   void ClientSendLoop(WsConnection* conn);
 
+  // --- HTTP ---
+  static std::string ReadHttpRequest(int fd);
+  bool HandleHttpFileRequest(int fd, const std::string& request);
+  bool HandleWsUpgrade(int fd);
+
   // --- WebSocket protocol ---
-  static bool PerformHttpHandshake(int fd, const std::string& expected_path);
+  static bool PerformHttpHandshake(int fd, const std::string& expected_path, const std::string& request);
   static bool ReceiveFrame(int fd, WsFrame& frame, int max_size);
   static std::string BuildFrame(const std::string& payload, bool text = true);
   static std::string BuildCloseFrame();

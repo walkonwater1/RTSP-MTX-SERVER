@@ -59,18 +59,12 @@ void RtspManager::Stop() {
   LOG_INFO("[RTSP] stopping all pipelines...");
 
   // Signal all pipelines to exit.
-  // IMPORTANT: do NOT pclose before joining — the loop threads may still be
-  // in fread/fwrite and pclose from here would race, causing double-free.
-  // PushLoop checks need_exit every 20ms via its cv timeout; PullLoop's
-  // fread will unblock when the ffmpeg child exits.
+  // IMPORTANT: do NOT pclose before joining — PullLoop's fread will unblock
+  // when the ffmpeg child exits.
   {
     std::lock_guard<std::mutex> lock(pipelines_mutex_);
     for (auto& p : pull_pipelines_) {
       p->need_exit.store(true);
-    }
-    for (auto& p : push_pipelines_) {
-      p->need_exit.store(true);
-      p->buf_cv.notify_all();
     }
   }
 
@@ -80,9 +74,6 @@ void RtspManager::Stop() {
     for (auto& p : pull_pipelines_) {
       if (p->pull_thread.joinable()) p->pull_thread.join();
     }
-    for (auto& p : push_pipelines_) {
-      if (p->push_thread.joinable()) p->push_thread.join();
-    }
     // Fallback: pclose any pipes the loops didn't clean up themselves
     for (auto& p : pull_pipelines_) {
       if (p->ffmpeg_pipe) {
@@ -90,14 +81,7 @@ void RtspManager::Stop() {
         p->ffmpeg_pipe = nullptr;
       }
     }
-    for (auto& p : push_pipelines_) {
-      if (p->ffmpeg_pipe) {
-        pclose(p->ffmpeg_pipe);
-        p->ffmpeg_pipe = nullptr;
-      }
-    }
     pull_pipelines_.clear();
-    push_pipelines_.clear();
   }
 
   KillMediaMtx();
@@ -359,212 +343,6 @@ bool RtspManager::LaunchPullFfmpeg(AudioPullPipeline* pipeline) {
   setvbuf(pipeline->ffmpeg_pipe, nullptr, _IONBF, 0);
 
   LOG_INFO("[RTSP-PULL] ffmpeg launched for {}", pipeline->session_id);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Audio Push Pipeline (PCM → RTSP)
-// ---------------------------------------------------------------------------
-
-AudioPushPipeline* RtspManager::StartAudioPush(const std::string& session_id,
-                                                const std::string& rtsp_url) {
-  // Stop any existing push pipeline for this session before starting a new one.
-  // Same reasoning as StartAudioPull: prevents duplicate pipelines on sleep→wake.
-  StopAudioPush(session_id);
-
-  auto pipeline = std::make_unique<AudioPushPipeline>();
-  pipeline->session_id = session_id;
-  pipeline->rtsp_url = rtsp_url;
-  pipeline->pcm_buf.resize(AudioPushPipeline::kBufferCapacity, 0);
-  pipeline->state.store(RtspPipelineState::Starting);
-
-  AudioPushPipeline* ptr = pipeline.get();
-
-  {
-    std::lock_guard<std::mutex> lock(pipelines_mutex_);
-    push_pipelines_.push_back(std::move(pipeline));
-  }
-
-  ptr->push_thread = std::thread(&RtspManager::PushLoop, ptr);
-
-  LOG_INFO("[RTSP-PUSH] started for session {}, url={}", session_id, rtsp_url);
-  return ptr;
-}
-
-void RtspManager::StopAudioPush(const std::string& session_id) {
-  std::lock_guard<std::mutex> lock(pipelines_mutex_);
-  auto it = std::find_if(push_pipelines_.begin(), push_pipelines_.end(),
-      [&](const auto& p) { return p->session_id == session_id; });
-  if (it != push_pipelines_.end()) {
-    auto* p = it->get();
-    p->need_exit.store(true);
-    p->buf_cv.notify_all();
-
-    // Do NOT pclose here — PushLoop checks need_exit every 20ms via its cv
-    // timeout, then pclose-s its own pipe. Calling pclose before joining
-    // races with PushLoop's fwrite/pclose and causes double-free.
-
-    if (p->push_thread.joinable()) p->push_thread.join();
-
-    // Fallback: if PushLoop didn't clean up (e.g., it exited early due to error),
-    // close the pipe now that the thread has definitely finished.
-    if (p->ffmpeg_pipe) {
-      pclose(p->ffmpeg_pipe);
-      p->ffmpeg_pipe = nullptr;
-    }
-    push_pipelines_.erase(it);
-    LOG_INFO("[RTSP-PUSH] stopped for session {}", session_id);
-  }
-}
-
-unsigned int RtspManager::FeedPushPcm(AudioPushPipeline* pipeline,
-                                       const int16_t* samples,
-                                       unsigned int count) {
-  if (!pipeline || pipeline->state.load() != RtspPipelineState::Running) {
-    return 0;
-  }
-
-  std::lock_guard<std::mutex> lock(pipeline->buf_mutex);
-  unsigned int used = pipeline->write_pos - pipeline->read_pos;
-  unsigned int free_slots = AudioPushPipeline::kBufferCapacity - used;
-  unsigned int to_write = std::min(count, free_slots);
-
-  for (unsigned int i = 0; i < to_write; i++) {
-    pipeline->pcm_buf[(pipeline->write_pos + i) % AudioPushPipeline::kBufferCapacity] = samples[i];
-  }
-  pipeline->write_pos += to_write;
-
-  if (to_write > 0) {
-    pipeline->buf_cv.notify_one();
-  }
-
-  if (to_write < count) {
-    static int drop_log_count = 0;
-    if (drop_log_count++ % 100 == 0) {
-      LOG_WARN("[RTSP-PUSH] buffer full for {}, dropped {} samples",
-               pipeline->session_id, count - to_write);
-    }
-  }
-
-  return to_write;
-}
-
-void RtspManager::SignalPushEof(AudioPushPipeline* pipeline) {
-  if (!pipeline) return;
-  pipeline->eof_signaled = true;
-  pipeline->buf_cv.notify_all();
-  LOG_DEBUG("[RTSP-PUSH] EOF signaled for {}", pipeline->session_id);
-}
-
-void RtspManager::PushLoop(AudioPushPipeline* pipeline) {
-  LOG_INFO("[RTSP-PUSH] loop started for session {}", pipeline->session_id);
-
-  if (!LaunchPushFfmpeg(pipeline)) {
-    LOG_ERROR("[RTSP-PUSH] failed to launch ffmpeg push for {}",
-              pipeline->session_id);
-    pipeline->state.store(RtspPipelineState::Error);
-    return;
-  }
-
-  pipeline->state.store(RtspPipelineState::Running);
-
-  std::vector<int16_t> local_buf(4096);
-  int push_loops = 0;
-
-  while (!pipeline->need_exit.load()) {
-    unsigned int read;
-    {
-      std::unique_lock<std::mutex> lock(pipeline->buf_mutex);
-      pipeline->buf_cv.wait_for(lock, std::chrono::milliseconds(20),  // was 100ms
-          [pipeline] {
-            return (pipeline->write_pos != pipeline->read_pos) ||
-                   pipeline->need_exit.load() || pipeline->eof_signaled;
-          });
-
-      if (pipeline->need_exit.load()) break;
-
-      unsigned int used = pipeline->write_pos - pipeline->read_pos;
-      read = std::min(static_cast<unsigned int>(local_buf.size()), used);
-
-      if (read == 0 && pipeline->eof_signaled) {
-        // No more data and EOF signaled.
-        // Flush ffmpeg's stdin and wait for it to finish encoding the
-        // last AAC frames before closing the pipe. Without this, the
-        // last ~0.5s of audio can be cut off.
-        if (pipeline->ffmpeg_pipe) {
-          fflush(pipeline->ffmpeg_pipe);
-          // Give ffmpeg time to encode + push final frames to RTSP
-          for (int i = 0; i < 40 && !pipeline->need_exit.load(); i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
-          }
-        }
-        break;
-      }
-      if (read == 0) continue;
-
-      for (unsigned int i = 0; i < read; i++) {
-        local_buf[i] = pipeline->pcm_buf[(pipeline->read_pos + i) % AudioPushPipeline::kBufferCapacity];
-      }
-      pipeline->read_pos += read;
-    }
-
-    size_t written = fwrite(local_buf.data(), sizeof(int16_t), read, pipeline->ffmpeg_pipe);
-    if (written != read) {
-      LOG_WARN("[RTSP-PUSH] fwrite short write ({}/{}) for {}, ferror={}",
-               written, read, pipeline->session_id, ferror(pipeline->ffmpeg_pipe));
-      if (ferror(pipeline->ffmpeg_pipe)) break;
-    }
-
-    push_loops++;
-    if (push_loops % 100 == 0) {
-      LOG_DEBUG("[RTSP-PUSH] alive, loops={}, samples_written={}",
-                push_loops, push_loops * local_buf.size());
-    }
-  }
-
-  pipeline->state.store(RtspPipelineState::Idle);
-  if (pipeline->ffmpeg_pipe) {
-    pclose(pipeline->ffmpeg_pipe);
-    pipeline->ffmpeg_pipe = nullptr;
-  }
-
-  LOG_INFO("[RTSP-PUSH] loop exited for session {}", pipeline->session_id);
-}
-
-bool RtspManager::LaunchPushFfmpeg(AudioPushPipeline* pipeline) {
-  // ffmpeg -f s16le -ar 16000 -ac 1 -i pipe:0 -c:a aac -f rtsp -rtsp_transport tcp <url>
-  std::ostringstream cmd;
-  cmd << "ffmpeg"
-      << " -re"
-      << " -f s16le -ar 16000 -ac 1"
-      << " -i pipe:0"
-      << " -c:a aac -b:a 128k"
-      << " -f rtsp"
-      << " -rtsp_transport tcp"
-      << " " << pipeline->rtsp_url
-      << " -loglevel warning"
-      << " 2>>/tmp/rtsp-server/ffmpeg_push.log";
-
-  LOG_INFO("[RTSP-PUSH] launching: {}", cmd.str());
-
-  sigset_t old_mask, block_mask;
-  sigemptyset(&block_mask);
-  sigaddset(&block_mask, SIGINT);
-  sigaddset(&block_mask, SIGTERM);
-  pthread_sigmask(SIG_BLOCK, &block_mask, &old_mask);
-
-  pipeline->ffmpeg_pipe = popen(cmd.str().c_str(), "w");
-
-  pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
-
-  if (!pipeline->ffmpeg_pipe) {
-    LOG_ERROR("[RTSP-PUSH] popen failed: {}", strerror(errno));
-    return false;
-  }
-
-  setvbuf(pipeline->ffmpeg_pipe, nullptr, _IONBF, 0);
-
-  LOG_INFO("[RTSP-PUSH] ffmpeg launched for {}", pipeline->session_id);
   return true;
 }
 

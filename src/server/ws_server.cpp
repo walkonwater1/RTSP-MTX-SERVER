@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <sstream>
+#include <vector>
 
 #include "nlohmann/json.hpp"
 #include "utils/base64.h"
@@ -258,8 +260,23 @@ void WsSignalingServer::AcceptLoop() {
       setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
-    // HTTP upgrade handshake
-    if (!PerformHttpHandshake(client_fd, cfg_.ws_path)) {
+    // Read HTTP request header
+    std::string http_request = ReadHttpRequest(client_fd);
+    if (http_request.empty()) {
+      LOG_WARN("[WS] failed to read HTTP request for fd={}", client_fd);
+      close(client_fd);
+      continue;
+    }
+
+    // Check if it's a plain HTTP GET (TTS file download)
+    if (http_request.find("GET /file?") == 0 && cfg_.enable_http_files) {
+      HandleHttpFileRequest(client_fd, http_request);
+      close(client_fd);
+      continue;
+    }
+
+    // WebSocket upgrade handshake
+    if (!PerformHttpHandshake(client_fd, cfg_.ws_path, http_request)) {
       LOG_WARN("[WS] HTTP handshake failed for fd={}", client_fd);
       close(client_fd);
       continue;
@@ -477,25 +494,9 @@ void WsSignalingServer::ClientSendLoop(WsConnection* conn) {
 // HTTP Upgrade Handshake
 // ---------------------------------------------------------------------------
 
-bool WsSignalingServer::PerformHttpHandshake(int fd, const std::string& expected_path) {
-  // Read the HTTP request
-  std::string request;
-  char buf[4096];
-  while (true) {
-    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-      LOG_WARN("[WS] recv during handshake: {}", n == 0 ? "EOF" : strerror(errno));
-      return false;
-    }
-    buf[n] = '\0';
-    request += buf;
-
-    if (request.find("\r\n\r\n") != std::string::npos) break;
-    if (request.size() > 16384) {
-      LOG_WARN("[WS] HTTP request too large");
-      return false;
-    }
-  }
+bool WsSignalingServer::PerformHttpHandshake(int fd, const std::string& expected_path,
+                                             const std::string& request) {
+  (void)fd;  // already read by caller (ReadHttpRequest)
 
   LOG_DEBUG("[WS] HTTP request:\n{}", request);
 
@@ -551,6 +552,108 @@ bool WsSignalingServer::PerformHttpHandshake(int fd, const std::string& expected
   LOG_DEBUG("[WS] HTTP response:\n{}", resp_str);
 
   return WriteAll(fd, resp_str.data(), resp_str.size(), 5);
+}
+
+// ---------------------------------------------------------------------------
+// Read HTTP Request
+// ---------------------------------------------------------------------------
+
+std::string WsSignalingServer::ReadHttpRequest(int fd) {
+  std::string request;
+  char buf[4096];
+  while (true) {
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) {
+      LOG_DEBUG("[WS] recv during HTTP read: {}", n == 0 ? "EOF" : strerror(errno));
+      return "";
+    }
+    buf[n] = '\0';
+    request += buf;
+
+    if (request.find("\r\n\r\n") != std::string::npos) break;
+    if (request.size() > 16384) {
+      LOG_WARN("[WS] HTTP request too large");
+      return "";
+    }
+  }
+  return request;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP File Request Handler (TTS audio download)
+// ---------------------------------------------------------------------------
+
+bool WsSignalingServer::HandleHttpFileRequest(int fd, const std::string& request) {
+  // Parse: GET /file?token=<filename> HTTP/1.1
+  auto path_start = request.find(" /");
+  if (path_start == std::string::npos) return false;
+  path_start++;  // skip space
+  auto path_end = request.find(" ", path_start);
+  if (path_end == std::string::npos) return false;
+  std::string path = request.substr(path_start, path_end - path_start);
+
+  // Extract token from query string
+  auto token_pos = path.find("token=");
+  if (token_pos == std::string::npos) {
+    LOG_DEBUG("[WS] HTTP GET without token: {}", path);
+    std::string not_found = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    WriteAll(fd, not_found.data(), not_found.size(), 3);
+    return false;
+  }
+
+  std::string token = path.substr(token_pos + 6);
+  // Strip trailing params if any
+  auto amp_pos = token.find("&");
+  if (amp_pos != std::string::npos) token = token.substr(0, amp_pos);
+  // Strip HTTP version suffix that may have bled in
+  auto space_pos = token.find(" ");
+  if (space_pos != std::string::npos) token = token.substr(0, space_pos);
+
+  // Security: only allow alphanumeric, underscore, dash in token
+  for (char c : token) {
+    if (!isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+      LOG_WARN("[WS] HTTP file request: invalid token '{}'", token);
+      std::string bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      WriteAll(fd, bad.data(), bad.size(), 3);
+      return false;
+    }
+  }
+
+  std::string file_path = cfg_.http_file_dir + "/" + token + ".wav";
+  LOG_DEBUG("[WS] HTTP file request: token={}, path={}", token, file_path);
+
+  // Open file
+  std::ifstream file(file_path, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    LOG_WARN("[WS] HTTP file not found: {}", file_path);
+    std::string not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    WriteAll(fd, not_found.data(), not_found.size(), 3);
+    return false;
+  }
+
+  size_t file_size = file.tellg();
+  file.seekg(0, std::ios::beg);
+
+  // Send HTTP response header
+  std::ostringstream header;
+  header << "HTTP/1.1 200 OK\r\n"
+         << "Content-Type: audio/wav\r\n"
+         << "Content-Length: " << file_size << "\r\n"
+         << "Connection: close\r\n"
+         << "Access-Control-Allow-Origin: *\r\n"
+         << "\r\n";
+
+  std::string header_str = header.str();
+  if (!WriteAll(fd, header_str.data(), header_str.size(), 5)) {
+    return false;
+  }
+
+  // Send file contents
+  std::vector<char> file_data(file_size);
+  file.read(file_data.data(), file_size);
+  bool ok = WriteAll(fd, file_data.data(), file_size, 15);
+  LOG_INFO("[WS] HTTP file served: {} ({} bytes) → fd={}", token, file_size, fd);
+  return ok;
 }
 
 // ---------------------------------------------------------------------------

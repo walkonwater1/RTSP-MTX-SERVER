@@ -25,9 +25,16 @@
 #include <string>
 #include <vector>
 
+#include <curl/curl.h>
+
 #include "brain/skill_manager.h"
 #include "memory/chat_memory.h"
 #include "memory/user_memory.h"
+
+// Forward declarations for direct library integration
+#ifdef SHERPA_ONNX_AVAILABLE
+struct SherpaOnnxOfflineRecognizer;
+#endif
 
 namespace rtsp_server {
 
@@ -118,10 +125,13 @@ public:
    *        Synchronous, blocking call.
    * @param text      user input text
    * @param session_id optional session context (for caching and per-session memory)
-   * @return result with LLM response and TTS audio path
+   * @param cancel     optional atomic flag — when set to true, aborts in-flight
+   *                   LLM and TTS as soon as possible
+   * @return result with LLM response and TTS audio path (result.ok=false if cancelled)
    */
   PipelineResult ProcessText(const std::string& text,
-                              const std::string& session_id = "");
+                              const std::string& session_id = "",
+                              std::atomic<bool>* cancel = nullptr);
 
   /**
    * @brief Process audio PCM data through ASR → LLM → TTS.
@@ -129,11 +139,13 @@ public:
    * @param pcm_data    raw PCM samples (16kHz mono S16LE)
    * @param sample_count number of samples
    * @param session_id  optional session context
+   * @param cancel      optional atomic flag for cancellation
    * @return result with ASR text, LLM response, and TTS audio path
    */
   PipelineResult ProcessAudio(const int16_t* pcm_data,
                                int sample_count,
-                               const std::string& session_id = "");
+                               const std::string& session_id = "",
+                               std::atomic<bool>* cancel = nullptr);
 
   /**
    * @brief Run ASR only (no LLM/TTS).
@@ -194,15 +206,31 @@ private:
 
   // In stub mode, we use curl to call Ollama directly
   std::string CallLlm(const std::string& prompt,
-                      const std::string& context = "");
+                      const std::string& context = "",
+                      std::atomic<bool>* cancel = nullptr);
   std::string CallLlmChat(const std::string& system_prompt,
                           const std::string& user_text,
                           const std::vector<ChatMessage>& history_msgs,
-                          const std::string& skill_context = "");
+                          const std::string& skill_context = "",
+                          std::atomic<bool>* cancel = nullptr);
   std::string EscapeJson(const std::string& s);
 
   // Cached TTS backend check (avoid forking shell every TTS call)
   bool piper_available_ = false;
+
+  // ── Direct sherpa-onnx ASR (avoid popen) ──────────
+#ifdef SHERPA_ONNX_AVAILABLE
+  const SherpaOnnxOfflineRecognizer* asr_recognizer_ = nullptr;
+#endif
+
+  // ── Direct espeak-ng TTS (avoid system()) ──────────
+  bool espeak_initialized_ = false;
+  int espeak_sample_rate_ = 22050;
+  // Helper: write WAV from int16 samples (used by espeak callback)
+  static bool WriteWavFile(const std::string& path,
+                           const std::vector<int16_t>& samples,
+                           int sample_rate,
+                           int num_channels = 1);
 
   // LLM response cache: hash(user_text) → response
   // Avoids redundant LLM calls for frequent queries like "你好", "你叫什么"

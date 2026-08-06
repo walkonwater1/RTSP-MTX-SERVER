@@ -16,6 +16,16 @@
 #include "brain/skills/skill_memory.h"
 #include "utils/logger.h"
 
+// Direct sherpa-onnx C API (avoids popen overhead)
+#ifdef SHERPA_ONNX_AVAILABLE
+#include "sherpa-onnx/c-api/c-api.h"
+#endif
+
+// Direct espeak-ng library (avoids system() overhead)
+#ifdef ESPEAK_NG_AVAILABLE
+#include "speech/espeak_min.h"
+#endif
+
 using json = nlohmann::json;
 
 namespace rtsp_server {
@@ -62,6 +72,59 @@ static std::string CtcDedup(const std::string& text) {
 }
 
 // ---------------------------------------------------------------------------
+// Direct TTS helpers (espeak-ng callback + WAV writer)
+// ---------------------------------------------------------------------------
+
+#ifdef ESPEAK_NG_AVAILABLE
+// Thread-local audio buffer for espeak callback (not thread-safe, but TTS
+// calls are serialized by the pipeline design).
+static std::vector<int16_t> g_tts_audio;
+
+static int tts_audio_callback(short* wav, int numsamples, espeak_EVENT* /*events*/) {
+  if (wav && numsamples > 0) {
+    g_tts_audio.insert(g_tts_audio.end(), wav, wav + numsamples);
+  }
+  return 0;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// WriteWavFile — write int16 PCM as WAV (used by direct espeak TTS)
+// ---------------------------------------------------------------------------
+
+bool PipelineBridge::WriteWavFile(const std::string& path,
+                                   const std::vector<int16_t>& samples,
+                                   int sample_rate,
+                                   int num_channels) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out) return false;
+
+  uint32_t data_size = static_cast<uint32_t>(samples.size() * sizeof(int16_t));
+  uint32_t chunk_size = 36 + data_size;
+  uint16_t bits_per_sample = 16;
+  uint32_t byte_rate = static_cast<uint32_t>(sample_rate) * num_channels * bits_per_sample / 8;
+  uint16_t block_align = static_cast<uint16_t>(num_channels * bits_per_sample / 8);
+
+  out.write("RIFF", 4);
+  out.write(reinterpret_cast<const char*>(&chunk_size), 4);
+  out.write("WAVE", 4);
+  out.write("fmt ", 4);
+  uint32_t fmt_size = 16;
+  uint16_t audio_format = 1;
+  out.write(reinterpret_cast<const char*>(&fmt_size), 4);
+  out.write(reinterpret_cast<const char*>(&audio_format), 2);
+  out.write(reinterpret_cast<const char*>(&num_channels), 2);
+  out.write(reinterpret_cast<const char*>(&sample_rate), 4);
+  out.write(reinterpret_cast<const char*>(&byte_rate), 4);
+  out.write(reinterpret_cast<const char*>(&block_align), 2);
+  out.write(reinterpret_cast<const char*>(&bits_per_sample), 2);
+  out.write("data", 4);
+  out.write(reinterpret_cast<const char*>(&data_size), 4);
+  out.write(reinterpret_cast<const char*>(samples.data()), data_size);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // libcurl helper
 // ---------------------------------------------------------------------------
 
@@ -71,6 +134,19 @@ size_t CurlWriteCallback(void* contents, size_t size, size_t nmemb, std::string*
   size_t total = size * nmemb;
   userp->append(static_cast<char*>(contents), total);
   return total;
+}
+
+// CURL progress callback — checks cancellation flag and aborts transfer.
+// Returns non-zero to abort. Signature: int(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+int CurlProgressCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                         curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+  if (clientp) {
+    auto* cancel = static_cast<std::atomic<bool>*>(clientp);
+    if (cancel->load()) {
+      return 1;  // non-zero aborts the transfer
+    }
+  }
+  return 0;
 }
 
 } // namespace
@@ -85,6 +161,18 @@ PipelineBridge::PipelineBridge(const PipelineBridgeConfig& cfg)
 }
 
 PipelineBridge::~PipelineBridge() {
+#ifdef SHERPA_ONNX_AVAILABLE
+  if (asr_recognizer_) {
+    SherpaOnnxDestroyOfflineRecognizer(asr_recognizer_);
+    asr_recognizer_ = nullptr;
+  }
+#endif
+#ifdef ESPEAK_NG_AVAILABLE
+  if (espeak_initialized_) {
+    espeak_Terminate();
+    espeak_initialized_ = false;
+  }
+#endif
   curl_global_cleanup();
 }
 
@@ -109,6 +197,53 @@ bool PipelineBridge::Initialize() {
   // Create runtime directories
   system("mkdir -p /tmp/rtsp-server/debug");
   system("mkdir -p /dev/shm/rtsp-server");
+
+  // ── Initialize direct sherpa-onnx ASR (avoid popen) ──
+#ifdef SHERPA_ONNX_AVAILABLE
+  {
+    std::string model_dir = cfg_.asr_model_path.empty()
+        ? "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/zipformer-ctc-zh"
+        : cfg_.asr_model_path;
+
+    SherpaOnnxOfflineRecognizerConfig asr_cfg;
+    memset(&asr_cfg, 0, sizeof(asr_cfg));
+    asr_cfg.feat_config.sample_rate = 16000;
+    asr_cfg.feat_config.feature_dim = 80;
+
+    std::string model_file = model_dir + "/model.int8.onnx";
+    std::string tokens_file = model_dir + "/tokens.txt";
+
+    asr_cfg.model_config.zipformer_ctc.model = model_file.c_str();
+    asr_cfg.model_config.tokens = tokens_file.c_str();
+    asr_cfg.model_config.provider = "cpu";
+    asr_cfg.model_config.num_threads = 4;
+    asr_cfg.decoding_method = "greedy_search";
+
+    asr_recognizer_ = SherpaOnnxCreateOfflineRecognizer(&asr_cfg);
+    if (asr_recognizer_) {
+      LOG_INFO("[Pipeline] sherpa-onnx ASR recognizer initialized (direct C API)");
+    } else {
+      LOG_WARN("[Pipeline] sherpa-onnx ASR recognizer creation failed — will use popen fallback");
+    }
+  }
+#endif
+
+  // ── Initialize direct espeak-ng TTS (avoid system()) ──
+#ifdef ESPEAK_NG_AVAILABLE
+  {
+    int sr = espeak_Initialize(AUDIO_OUTPUT_RETRIEVAL, 0, nullptr, 0);
+    if (sr > 0) {
+      espeak_sample_rate_ = sr;
+      espeak_SetVoiceByName(cfg_.tts_voice.c_str());
+      espeak_SetParameter(espeakRATE, cfg_.tts_rate, 0);
+      espeak_initialized_ = true;
+      LOG_INFO("[Pipeline] espeak-ng initialized ({}Hz, voice={}, rate={}) — direct library",
+               espeak_sample_rate_, cfg_.tts_voice, cfg_.tts_rate);
+    } else {
+      LOG_WARN("[Pipeline] espeak-ng init failed (returned {}) — will use system() fallback", sr);
+    }
+  }
+#endif
 
   // Create memory persist dir
   if (cfg_.memory_enabled && !cfg_.memory_persist_dir.empty()) {
@@ -171,12 +306,19 @@ bool PipelineBridge::Initialize() {
 // ---------------------------------------------------------------------------
 
 PipelineResult PipelineBridge::ProcessText(const std::string& text,
-                                            const std::string& session_id) {
+                                            const std::string& session_id,
+                                            std::atomic<bool>* cancel) {
   PipelineResult result;
   auto t_total_start = std::chrono::steady_clock::now();
 
   if (!ready_.load()) {
     result.error = "pipeline not initialized";
+    return result;
+  }
+
+  // Check cancellation before any heavy work
+  if (cancel && cancel->load()) {
+    result.error = "cancelled";
     return result;
   }
 
@@ -257,6 +399,12 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
         result.llm_response = sr.result_text;
         result.skill_direct = true;
 
+        // Check cancellation before TTS synthesis
+        if (cancel && cancel->load()) {
+          result.error = "cancelled before TTS (skill)";
+          return result;
+        }
+
         // Still synthesize TTS for direct responses
         std::string wav_path;
         if (!session_id.empty()) {
@@ -330,7 +478,18 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   }
 
   if (result.llm_response.empty()) {
-    result.llm_response = CallLlmChat(system_prompt, text, history_msgs, skill_context);
+    // Check cancellation before expensive LLM call
+    if (cancel && cancel->load()) {
+      result.error = "cancelled before LLM";
+      return result;
+    }
+    result.llm_response = CallLlmChat(system_prompt, text, history_msgs, skill_context, cancel);
+
+    // Check if LLM was cancelled
+    if (cancel && cancel->load()) {
+      result.error = "cancelled during LLM";
+      return result;
+    }
 
     // Cache the result for frequent static queries
     if (!sr.hit && history_msgs.empty() && skill_context.empty() && !result.llm_response.empty()) {
@@ -354,6 +513,53 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
   LOG_INFO("[Pipeline] LLM response ({}ms): \"{}\"", t_llm_ms, result.llm_response);
 
+  // ── 4.5. Strip emoji & invisible characters ─────────────
+  // LLM models sometimes generate emoji, variation selectors,
+  // and other Unicode symbols that TTS cannot pronounce.
+  {
+    std::string filtered;
+    filtered.reserve(result.llm_response.size());
+    for (size_t i = 0; i < result.llm_response.size(); ) {
+      // Decode UTF-8 codepoint
+      uint32_t cp = 0;
+      int len = 0;
+      unsigned char c = static_cast<unsigned char>(result.llm_response[i]);
+      if ((c & 0x80) == 0)      { cp = c;          len = 1; }
+      else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+      else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+      else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+      else { i++; continue; }  // invalid byte, skip
+
+      if (i + len > result.llm_response.size()) break;
+      for (int j = 1; j < len; j++) {
+        cp = (cp << 6) | (static_cast<unsigned char>(result.llm_response[i + j]) & 0x3F);
+      }
+
+      // Keep codepoint unless it's in an emoji / decorative range
+      bool keep = true;
+      if (cp == 0x200D || cp == 0xFE0F || cp == 0xFE00) keep = false;        // ZWJ, variation selectors
+      else if (cp >= 0x1F600 && cp <= 0x1F64F) keep = false;  // emoticons
+      else if (cp >= 0x1F300 && cp <= 0x1F5FF) keep = false;  // symbols & pictographs
+      else if (cp >= 0x1F680 && cp <= 0x1F6FF) keep = false;  // transport & map
+      else if (cp >= 0x1F1E0 && cp <= 0x1F1FF) keep = false;  // flags
+      else if (cp >= 0x1F900 && cp <= 0x1F9FF) keep = false;  // supplemental symbols
+      else if (cp >= 0x1FA00 && cp <= 0x1FAFF) keep = false;  // chess & extended
+      else if (cp >= 0x2600 && cp <= 0x27BF) keep = false;    // misc symbols / dingbats
+      else if (cp >= 0x1F3FB && cp <= 0x1F3FF) keep = false;  // skin tone modifiers
+      else if (cp >= 0xE000 && cp <= 0xF8FF) keep = false;    // private use area
+
+      if (keep) {
+        for (int j = 0; j < len; j++) filtered += result.llm_response[i + j];
+      }
+      i += len;
+    }
+    if (filtered.size() != result.llm_response.size()) {
+      LOG_INFO("[Pipeline] stripped {} emoji chars from LLM response",
+               result.llm_response.size() - filtered.size());
+      result.llm_response = std::move(filtered);
+    }
+  }
+
   // ── 5. Update conversation memory ──────────────────────
   if (cfg_.memory_enabled && !session_id.empty()) {
     ChatMemory* mem = GetSessionMemory(session_id, user_id);
@@ -375,6 +581,12 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
   }
 
   // ── 6. TTS ─────────────────────────────────────────────
+  // Check cancellation before expensive TTS synthesis
+  if (cancel && cancel->load()) {
+    result.error = "cancelled before TTS";
+    return result;
+  }
+
   auto t_tts_start = std::chrono::steady_clock::now();
   std::string wav_path;
   if (!session_id.empty()) {
@@ -411,7 +623,8 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
 
 PipelineResult PipelineBridge::ProcessAudio(const int16_t* pcm_data,
                                               int sample_count,
-                                              const std::string& session_id) {
+                                              const std::string& session_id,
+                                              std::atomic<bool>* cancel) {
   PipelineResult result;
 
   if (!ready_.load()) {
@@ -473,7 +686,7 @@ PipelineResult PipelineBridge::ProcessAudio(const int16_t* pcm_data,
   LOG_INFO("[Pipeline] ASR result: \"{}\"", result.asr_text);
 
   // 2. LLM + TTS (via ProcessText which now has skills + memory)
-  auto llm_result = ProcessText(result.asr_text, session_id);
+  auto llm_result = ProcessText(result.asr_text, session_id, cancel);
   result.llm_response = llm_result.llm_response;
   result.tts_audio_path = llm_result.tts_audio_path;
   result.ok = !llm_result.llm_response.empty();
@@ -505,102 +718,126 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
     return "";
   }
 
-  // Write PCM to WAV file (per-session to avoid race conditions)
-  std::string wav_path = session_id.empty()
-      ? "/dev/shm/rtsp-server/asr_latest.wav"
-      : ("/dev/shm/rtsp-server/asr_" + session_id + ".wav");
-  {
-    std::ofstream f(wav_path, std::ios::binary);
-    if (!f) return "";
+  auto t_asr_start = std::chrono::steady_clock::now();
 
-    uint32_t data_size = sample_count * sizeof(int16_t);
-    uint32_t file_size = 36 + data_size;
-
-    f.write("RIFF", 4);
-    f.write(reinterpret_cast<const char*>(&file_size), 4);
-    f.write("WAVE", 4);
-    f.write("fmt ", 4);
-    uint32_t fmt_size = 16;
-    uint16_t audio_fmt = 1, num_ch = 1, block_align = 2, bps = 16;
-    uint32_t sample_rate = 16000, byte_rate = 32000;
-    f.write(reinterpret_cast<const char*>(&fmt_size), 4);
-    f.write(reinterpret_cast<const char*>(&audio_fmt), 2);
-    f.write(reinterpret_cast<const char*>(&num_ch), 2);
-    f.write(reinterpret_cast<const char*>(&sample_rate), 4);
-    f.write(reinterpret_cast<const char*>(&byte_rate), 4);
-    f.write(reinterpret_cast<const char*>(&block_align), 2);
-    f.write(reinterpret_cast<const char*>(&bps), 2);
-    f.write("data", 4);
-    f.write(reinterpret_cast<const char*>(&data_size), 4);
-    f.write(reinterpret_cast<const char*>(pcm_data), data_size);
-  }
-
-  // Try real ASR via sherpa-onnx-offline
-  static const char* kSherpaBin =
-      "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/bin/sherpa-onnx-offline";
-  static const char* kModelDir =
-      "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/zipformer-ctc-zh";
-  static const char* kSherpaLib =
-      "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/lib";
-
-  // Check if sherpa-onnx binary exists
-  static bool sherpa_available = (access(kSherpaBin, X_OK) == 0);
-
-  if (sherpa_available) {
-    auto t_asr_start = std::chrono::steady_clock::now();
-    std::ostringstream cmd;
-    cmd << "LD_LIBRARY_PATH=" << kSherpaLib << ":$LD_LIBRARY_PATH "
-        << kSherpaBin
-        << " --tokens=" << kModelDir << "/tokens.txt"
-        << " --zipformer-ctc-model=" << kModelDir << "/model.int8.onnx"
-        << " --model-type=zipformer_ctc"
-        << " --num-threads=4"
-        << " --decoding-method=greedy_search"
-        << " " << wav_path
-        << " 2>/dev/null";
-
-    std::string output;
-    FILE* p = popen(cmd.str().c_str(), "r");
-    if (p) {
-      char buf[4096];
-      while (fgets(buf, sizeof(buf), p)) {
-        output += buf;
-      }
-      pclose(p);
+#ifdef SHERPA_ONNX_AVAILABLE
+  // ── Direct sherpa-onnx C API (no fork/exec, model stays in memory) ──
+  if (asr_recognizer_) {
+    // Convert int16 → float (sherpa-onnx expects float samples)
+    std::vector<float> float_samples(sample_count);
+    for (int i = 0; i < sample_count; i++) {
+      float_samples[i] = pcm_data[i] / 32768.0f;
     }
 
-    // Parse JSON output: extract "text" field
-    if (!output.empty()) {
-      try {
-        // Find the last JSON line (sherpa-onnx outputs config + result lines)
-        auto j = nlohmann::json::parse(output);
-        std::string text = j.value("text", "");
-        if (!text.empty()) {
-          // Trim
-          auto start = text.find_first_not_of(" \t\n\r");
-          auto end = text.find_last_not_of(" \t\n\r");
-          if (start != std::string::npos) {
-            text = text.substr(start, end - start + 1);
-          }
-          if (!text.empty()) {
-            text = CtcDedup(text);
-            auto t_asr_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - t_asr_start).count();
-            LOG_INFO("[ASR] recognized: \"{}\" ({} samples, {:.1f}s, ASR={}ms, RMS={:.4f})",
-                     text, sample_count, sample_count / 16000.0f, t_asr_total_ms, rms);
-            return text;
-          }
+    const SherpaOnnxOfflineStream* stream =
+        SherpaOnnxCreateOfflineStream(asr_recognizer_);
+    if (stream) {
+      SherpaOnnxAcceptWaveformOffline(stream, 16000,
+                                       float_samples.data(), sample_count);
+      SherpaOnnxDecodeOfflineStream(asr_recognizer_, stream);
+
+      const SherpaOnnxOfflineRecognizerResult* result =
+          SherpaOnnxGetOfflineStreamResult(stream);
+      std::string text;
+      if (result && result->text) {
+        text = result->text;
+      }
+      if (result) {
+        SherpaOnnxDestroyOfflineRecognizerResult(result);
+      }
+      SherpaOnnxDestroyOfflineStream(stream);
+
+      if (!text.empty()) {
+        // Trim
+        auto start = text.find_first_not_of(" \t\n\r");
+        auto end = text.find_last_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+          text = text.substr(start, end - start + 1);
         }
-      } catch (...) {
-        // JSON parse failed — fall through to empty check
+        if (!text.empty()) {
+          text = CtcDedup(text);
+          auto t_asr_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t_asr_start).count();
+          LOG_INFO("[ASR] recognized: \"{}\" ({} samples, {:.1f}s, ASR={}ms, RMS={:.4f}) [direct C API]",
+                   text, sample_count, sample_count / 16000.0f, t_asr_total_ms, rms);
+          return text;
+        }
+      }
+    }
+
+    LOG_DEBUG("[ASR] direct C API returned empty ({} samples)", sample_count);
+  }
+#endif
+
+  // ── Fallback: popen to sherpa-onnx-offline binary ──────
+  {
+    // Write PCM to WAV file
+    std::string wav_path = session_id.empty()
+        ? "/dev/shm/rtsp-server/asr_latest.wav"
+        : ("/dev/shm/rtsp-server/asr_" + session_id + ".wav");
+    {
+      std::ofstream f(wav_path, std::ios::binary);
+      if (!f) {
+        LOG_DEBUG("[ASR] no speech recognized ({} samples, {:.1f}s audio)",
+                  sample_count, sample_count / 16000.0f);
+        return "";
       }
 
-      // If JSON parsing failed but we got output, try to extract text manually
-      // sherpa-onnx output format has the last line as JSON
-      size_t last_brace = output.rfind('{');
-      if (last_brace != std::string::npos) {
+      uint32_t data_size = sample_count * sizeof(int16_t);
+      uint32_t file_size = 36 + data_size;
+
+      f.write("RIFF", 4);
+      f.write(reinterpret_cast<const char*>(&file_size), 4);
+      f.write("WAVE", 4);
+      f.write("fmt ", 4);
+      uint32_t fmt_size = 16;
+      uint16_t audio_fmt = 1, num_ch = 1, block_align = 2, bps = 16;
+      uint32_t sample_rate = 16000, byte_rate = 32000;
+      f.write(reinterpret_cast<const char*>(&fmt_size), 4);
+      f.write(reinterpret_cast<const char*>(&audio_fmt), 2);
+      f.write(reinterpret_cast<const char*>(&num_ch), 2);
+      f.write(reinterpret_cast<const char*>(&sample_rate), 4);
+      f.write(reinterpret_cast<const char*>(&byte_rate), 4);
+      f.write(reinterpret_cast<const char*>(&block_align), 2);
+      f.write(reinterpret_cast<const char*>(&bps), 2);
+      f.write("data", 4);
+      f.write(reinterpret_cast<const char*>(&data_size), 4);
+      f.write(reinterpret_cast<const char*>(pcm_data), data_size);
+    }
+
+    static const char* kSherpaBin =
+        "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/bin/sherpa-onnx-offline";
+    static const char* kModelDir =
+        "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/zipformer-ctc-zh";
+    static const char* kSherpaLib =
+        "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/lib";
+    static bool sherpa_bin_avail = (access(kSherpaBin, X_OK) == 0);
+
+    if (sherpa_bin_avail) {
+      std::ostringstream cmd;
+      cmd << "LD_LIBRARY_PATH=" << kSherpaLib << ":$LD_LIBRARY_PATH "
+          << kSherpaBin
+          << " --tokens=" << kModelDir << "/tokens.txt"
+          << " --zipformer-ctc-model=" << kModelDir << "/model.int8.onnx"
+          << " --model-type=zipformer_ctc"
+          << " --num-threads=4"
+          << " --decoding-method=greedy_search"
+          << " " << wav_path
+          << " 2>/dev/null";
+
+      std::string output;
+      FILE* p = popen(cmd.str().c_str(), "r");
+      if (p) {
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), p)) {
+          output += buf;
+        }
+        pclose(p);
+      }
+
+      if (!output.empty()) {
         try {
-          auto j = nlohmann::json::parse(output.substr(last_brace));
+          auto j = nlohmann::json::parse(output);
           std::string text = j.value("text", "");
           if (!text.empty()) {
             auto start = text.find_first_not_of(" \t\n\r");
@@ -610,18 +847,38 @@ std::string PipelineBridge::TranscribeAudio(const int16_t* pcm_data,
             }
             if (!text.empty()) {
               text = CtcDedup(text);
-              LOG_INFO("[ASR] recognized: \"{}\" (RMS={:.4f})", text, rms);
+              auto t_asr_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t_asr_start).count();
+              LOG_INFO("[ASR] recognized: \"{}\" ({} samples, {:.1f}s, ASR={}ms, RMS={:.4f}) [popen fallback]",
+                       text, sample_count, sample_count / 16000.0f, t_asr_total_ms, rms);
               return text;
             }
           }
-        } catch (...) {}
+        } catch (...) {
+          size_t last_brace = output.rfind('{');
+          if (last_brace != std::string::npos) {
+            try {
+              auto j = nlohmann::json::parse(output.substr(last_brace));
+              std::string text = j.value("text", "");
+              if (!text.empty()) {
+                auto start = text.find_first_not_of(" \t\n\r");
+                auto end = text.find_last_not_of(" \t\n\r");
+                if (start != std::string::npos) {
+                  text = text.substr(start, end - start + 1);
+                }
+                if (!text.empty()) {
+                  text = CtcDedup(text);
+                  LOG_INFO("[ASR] recognized: \"{}\" (RMS={:.4f}) [popen fallback]", text, rms);
+                  return text;
+                }
+              }
+            } catch (...) {}
+          }
+        }
       }
     }
-
-    LOG_DEBUG("[ASR] sherpa-onnx returned empty or no speech detected ({} samples)", sample_count);
   }
 
-  // No real ASR available or no speech detected — return empty
   LOG_DEBUG("[ASR] no speech recognized ({} samples, {:.1f}s audio)",
             sample_count, sample_count / 16000.0f);
   return "";
@@ -640,7 +897,6 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
     std::ifstream check(cached, std::ios::binary);
     if (check.good()) {
       check.close();
-      // Copy from cache via file streams (avoids shell fork)
       std::ifstream src(cached, std::ios::binary);
       std::ofstream dst(output_path, std::ios::binary);
       if (src && dst) {
@@ -651,8 +907,80 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
     }
   }
 
+  bool ok = false;
+
+  // ── Direct espeak-ng library (fastest, no fork/exec) ──
+#ifdef ESPEAK_NG_AVAILABLE
+  if (espeak_initialized_ && (cfg_.tts_backend == "espeak" || cfg_.tts_backend.empty())) {
+    auto t_tts_start = std::chrono::steady_clock::now();
+
+    g_tts_audio.clear();
+    espeak_SetSynthCallback(tts_audio_callback);
+
+    espeak_ERROR err = espeak_Synth(text.c_str(), text.size() + 1,
+                                    0, POS_CHARACTER, 0,
+                                    espeakCHARS_UTF8, nullptr, nullptr);
+    if (err == EE_OK) {
+      espeak_Synchronize();
+
+      if (!g_tts_audio.empty()) {
+        // If sample rate doesn't match target, resample via ffmpeg pipe
+        if (espeak_sample_rate_ != cfg_.tts_sample_rate) {
+          std::ostringstream ffmpeg_cmd;
+          ffmpeg_cmd << "ffmpeg -f s16le -ar " << espeak_sample_rate_
+                     << " -ac 1 -i pipe:0"
+                     << " -ar " << cfg_.tts_sample_rate << " -ac 1"
+                     << " -y " << output_path
+                     << " 2>/dev/null";
+
+          FILE* ffmpeg = popen(ffmpeg_cmd.str().c_str(), "w");
+          if (ffmpeg) {
+            fwrite(g_tts_audio.data(), sizeof(int16_t), g_tts_audio.size(), ffmpeg);
+            int ff_ret = pclose(ffmpeg);
+            if (ff_ret == 0) {
+              auto t_tts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t_tts_start).count();
+              LOG_INFO("[TTS] espeak (direct) {}ms: \"{}\" → {}", t_tts_ms, text, output_path);
+              ok = true;
+            }
+          }
+          if (!ok) {
+            LOG_WARN("[TTS] espeak direct ffmpeg resample failed, trying WAV write");
+          }
+        }
+
+        // Direct WAV write (no resample needed, or ffmpeg fallback)
+        if (!ok) {
+          if (WriteWavFile(output_path, g_tts_audio, espeak_sample_rate_)) {
+            auto t_tts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_tts_start).count();
+            LOG_INFO("[TTS] espeak (direct, no-resample) {}ms: \"{}\" → {}", t_tts_ms, text, output_path);
+            ok = true;
+          }
+        }
+      }
+    }
+
+    if (ok) {
+      // Cache and return
+      if (cfg_.tts_cache_enabled) {
+        std::string cached = GetCachePath(text);
+        std::ifstream src(output_path, std::ios::binary);
+        std::ofstream dst(cached, std::ios::binary);
+        if (src && dst) {
+          dst << src.rdbuf();
+        }
+      }
+      return true;
+    }
+
+    LOG_WARN("[TTS] espeak direct synthesis failed, falling back to system()");
+  }
+#endif
+
+  // ── system()-based TTS (fallback / edge_tts / piper) ──
+
   // Generate TTS using the configured backend.
-  // When linked with HAS_VOICE_PIPELINE, this uses the native Piper library.
   std::ostringstream cmd;
 
 #ifdef HAS_VOICE_PIPELINE
@@ -685,7 +1013,7 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
     }
   }
 
-  // Fallback to espeak-ng
+  // Fallback to espeak-ng via system()
   if (cmd.str().empty()) {
     cmd << "espeak-ng -v " << cfg_.tts_voice
         << " -s " << cfg_.tts_rate
@@ -729,10 +1057,12 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
   }
 #endif
 
-  int ret = system(cmd.str().c_str());
-  if (ret != 0) {
-    LOG_ERROR("[TTS] synthesis failed (exit={}) for: \"{}\"", ret, text);
-    return false;
+  if (!ok) {
+    int ret = system(cmd.str().c_str());
+    if (ret != 0) {
+      LOG_ERROR("[TTS] synthesis failed (exit={}) for: \"{}\"", ret, text);
+      return false;
+    }
   }
 
   // Cache the result
@@ -754,7 +1084,8 @@ bool PipelineBridge::SynthesizeTts(const std::string& text,
 // ---------------------------------------------------------------------------
 
 std::string PipelineBridge::CallLlm(const std::string& prompt,
-                                    const std::string& context) {
+                                    const std::string& context,
+                                    std::atomic<bool>* cancel) {
   if (prompt == "ping") {
     // Just check connectivity
     CURL* curl = curl_easy_init();
@@ -774,6 +1105,9 @@ std::string PipelineBridge::CallLlm(const std::string& prompt,
     if (res == CURLE_OK) return "ok";
     return "error: " + std::string(curl_easy_strerror(res));
   }
+
+  // Check cancellation before starting
+  if (cancel && cancel->load()) return "";
 
   // Actual LLM inference
   CURL* curl = curl_easy_init();
@@ -799,6 +1133,13 @@ std::string PipelineBridge::CallLlm(const std::string& prompt,
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
 
+  // Enable cancellation via progress callback
+  if (cancel) {
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  }
+
   std::string response;
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
@@ -808,7 +1149,11 @@ std::string PipelineBridge::CallLlm(const std::string& prompt,
   curl_easy_cleanup(curl);
 
   if (res != CURLE_OK) {
-    LOG_ERROR("[LLM] curl error: {}", curl_easy_strerror(res));
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+      LOG_INFO("[LLM] request cancelled by interrupt");
+    } else {
+      LOG_ERROR("[LLM] curl error: {}", curl_easy_strerror(res));
+    }
     return "";
   }
 
@@ -836,7 +1181,11 @@ std::string PipelineBridge::CallLlm(const std::string& prompt,
 std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
                                          const std::string& user_text,
                                          const std::vector<ChatMessage>& history_msgs,
-                                         const std::string& skill_context) {
+                                         const std::string& skill_context,
+                                         std::atomic<bool>* cancel) {
+  // Check cancellation before starting
+  if (cancel && cancel->load()) return "";
+
   CURL* curl = curl_easy_init();
   if (!curl) return "";
 
@@ -891,6 +1240,13 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
 
+  // Enable cancellation via progress callback
+  if (cancel) {
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  }
+
   std::string response;
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
@@ -900,7 +1256,11 @@ std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
   curl_easy_cleanup(curl);
 
   if (res != CURLE_OK) {
-    LOG_ERROR("[LLM] curl error: {}", curl_easy_strerror(res));
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+      LOG_INFO("[LLM] chat request cancelled by interrupt");
+    } else {
+      LOG_ERROR("[LLM] curl error: {}", curl_easy_strerror(res));
+    }
     return "";
   }
 
