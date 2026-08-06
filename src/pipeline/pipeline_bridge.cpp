@@ -511,8 +511,6 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
     return result;
   }
 
-  LOG_INFO("[LLM] \"{}\" ({}ms)", result.llm_response, t_llm_ms);
-
   // ── 4.5. Strip emoji & invisible characters ─────────────
   // LLM models sometimes generate emoji, variation selectors,
   // and other Unicode symbols that TTS cannot pronounce.

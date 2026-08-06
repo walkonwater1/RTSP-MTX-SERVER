@@ -624,8 +624,8 @@ static void HandleWsMessage(int client_fd, const std::string& event,
                         // Color: green <2s, yellow <4s, red >=4s
                         const char* c = total_ms < 2000 ? "\033[1;32m" :
                                         total_ms < 4000 ? "\033[1;33m" : "\033[1;31m";
-                        LOG_INFO("\033[1;36m[Pipeline]\033[0m {} | ASR={}ms LLM={}ms TTS={}ms {}TOTAL={}ms\033[0m",
-                                 session_id, asr_ms, result.llm_ms, result.tts_ms, c, total_ms);
+                        LOG_INFO("\033[1;36m[Pipeline]\033[0m {} | \"{}\" | ASR={}ms LLM={}ms TTS={}ms {}TOTAL={}ms\033[0m",
+                                 session_id, result.llm_response, asr_ms, result.llm_ms, result.tts_ms, c, total_ms);
 
                         // Send LLM result to robot
                         if (g_ws_server) {
