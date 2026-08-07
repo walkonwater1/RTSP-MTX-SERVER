@@ -63,9 +63,10 @@
 |------|---------|------|------|
 | **ASR** | Zipformer CTC (sherpa-onnx) | ~100ms | CPU 推理，4 线程 |
 | **LLM** | **Ollama + qwen2.5:3b** (NUC, 192.168.10.54) | **~300ms** | Q4_K_M 量化，CPU SIMD 高度优化 |
-| **LLM** (实验) | TensorRT-LLM + Qwen3-4B (Orin NX GPU) | ~2-3s | 嵌入式GPU，kernel启动开销大，不适合小batch LLM |
+| **LLM** (实验) | TensorRT-LLM + Qwen3-0.6B (Orin NX GPU) | ~300-600ms | 速度快但质量差（中英混杂），不适合对话 |
+| **LLM** (实验) | TensorRT-LLM + Qwen3-4B (Orin NX GPU) | ~2-3s | 嵌入式GPU W4A16 ~33ms/token，物理带宽限制 |
 | **TTS** (当前) | Edge-TTS (zh-CN-XiaoxiaoNeural, 微软云) | **~1-3s** | 音质好但延迟高，受网络波动影响 |
-| **TTS** (计划) | ChatTTS 本地部署 (Orin NX) | **~200ms** | 目标：总延迟控制在 1s 内 |
+| **TTS** (计划) | ChatTTS 本地部署 (Orin NX) | **~200ms** | Orin NX 更适合单次推理（TTS），不适合自回归推理（LLM） |
 
 ### LLM 后端
 
@@ -78,7 +79,11 @@ auto backend = CreateLlmBackend(cfg);  // 自动选择可用后端
 ```
 
 - **Ollama** (`src/llm/ollama_backend.cpp`): 主用后端，NUC CPU 运行 qwen2.5:3b Q4_K_M，实测 ~300ms/回复，支持流式 (`ChatStream`)
-- **TensorRT-LLM** (`src/llm/tensorrt_backend.cpp`): 实验性后端，Orin NX GPU W4A16，实际 ~2-3s/回复（嵌入式GPU不适合小batch LLM推理）
+- **TensorRT-LLM** (`src/llm/tensorrt_backend.cpp`): 实验性后端，Orin NX GPU W4A16
+  - Qwen3-4B: ~2-3s（~33ms/token，3.2GB 权重 ÷ 102GB/s 显存带宽 = 物理极限）
+  - Qwen3-0.6B: ~300-600ms（速度快但中文质量差，偶发中英混杂）
+  - **结论**: 嵌入式GPU的kernel启动延迟 + 显存带宽限制，不适合自回归LLM推理
+  - **Orin NX 更适合 TTS**: 单次非自回归推理，能充分利用GPU并行优势
 - 配置中默认使用 Ollama 后端，TensorRT 可作为 fallback
 
 ### TTS 当前状态
@@ -511,6 +516,18 @@ Pipeline 处理用户输入时分两条路径：
 | Edge-TTS | 微软云 | ~1-3s | ⭐⭐⭐ 温暖自然 | 当前使用 |
 
 ChatTTS 是 2.5 亿参数的神经 TTS 大模型，支持笑声/停顿等韵律控制，在 Orin NX GPU 上推理预计 ~200ms/句。切换后将实现 **≤1 秒端到端语音交互**。
+
+### Orin NX 硬件定位：TTS ✅  LLM ❌
+
+经过实测对比，Orin NX (Jetson, 1024 CUDA cores, ~102 GB/s 显存带宽) 的定位如下：
+
+| 任务 | 模型 | 实测延迟 | 适合？ | 原因 |
+|------|------|---------|--------|------|
+| **LLM** | Qwen3-4B W4A16 | ~2-3s | ❌ | 3.2GB 权重 ÷ 102GB/s ≈ 31ms/token 物理下限，自回归需串行生成 60-100 tokens |
+| **LLM** | Qwen3-0.6B W4A16 | ~300-600ms | ⚠️ | 速度快但质量差，中文问题偶尔回英文 |
+| **TTS** | ChatTTS (250M) | ~200ms | ✅ | 单次并行推理，GPU 并行优势充分发挥 |
+
+**关键洞察**: LLM 是自回归（token by token），受显存带宽瓶颈限制；TTS 是单次前向推理，GPU 能并行处理。这就是为什么同样的硬件，TTS 快而 LLM 慢。
 
 ```bash
 # ChatTTS 测试（当前可手动验证音质）
