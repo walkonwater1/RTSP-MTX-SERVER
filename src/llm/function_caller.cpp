@@ -1,50 +1,32 @@
-#include "utils/logger.h"
 /**
  * Function Calling — LLM 驱动的工具选择（实现）
  *
- * 学习要点:
- *   1. Function Calling 是 Agent 的核心能力 — LLM 不再只是"聊天"，而是能"决策"
- *   2. Prompt Engineering 是关键 — 需要清晰告诉 LLM 输出格式
- *   3. 容错设计 — JSON 解析失败、LLM 返回非法格式时优雅降级
+ * 重构说明:
+ *   原先直接使用 curl HTTP POST 调用 Ollama /api/chat。
+ *   现在通过 LLMBackend 抽象接口，可以无缝切换后端。
  *
- * Ollama API:
- *   POST /api/chat
- *   {
- *     "model": "qwen2.5:3b",
- *     "messages": [
- *       {"role": "system", "content": "..."},
- *       {"role": "user", "content": "..."}
- *     ],
- *     "stream": false,
- *     "options": {"temperature": 0}  // 低温 → 更确定性的输出
- *   }
+ *   注意: Function Calling 场景需要 temperature=0（确定性输出），
+ *   当前 LLMBackend 接口暂未暴露 temperature 参数（使用后端默认值）。
+ *   若后端默认 temperature 偏高导致 JSON 输出不稳定，可考虑:
+ *     1. 在 LLMBackend 接口增加 ChatParams 结构体
+ *     2. 或使用专门的 fc_model（小参数 + 低温度配置）
  */
 
 #include "llm/function_caller.h"
 
-#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <sstream>
 
+#include "utils/logger.h"
+
 using json = nlohmann::json;
-
-// ── curl 回调 ─────────────────────────────────────────
-
-static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata)
-{
-    auto* str = static_cast<std::string*>(userdata);
-    str->append(ptr, size * nmemb);
-    return size * nmemb;
-}
 
 // ── 构造 ──────────────────────────────────────────────
 
-FunctionCaller::FunctionCaller(const std::string& ollama_host,
-                               const std::string& model)
-    : host_(ollama_host)
-    , model_(model)
+FunctionCaller::FunctionCaller(std::shared_ptr<rtsp_server::LLMBackend> backend)
+    : backend_(std::move(backend))
 {}
 
 // ── 核心：工具选择 ────────────────────────────────────
@@ -56,42 +38,35 @@ ToolDecision FunctionCaller::decide(const std::string& user_message,
         return {false, "", {}};
     }
 
-    // 1. 构建 messages
-    json messages = json::array();
-
-    messages.push_back({
-        {"role", "system"},
-        {"content", build_system_prompt(tools)}
-    });
-
-    messages.push_back({
-        {"role", "user"},
-        {"content", build_user_message(user_message)}
-    });
-
-    // 2. 构建请求体
-    json body;
-    body["model"] = model_;
-    body["messages"] = messages;
-    body["stream"] = false;
-    body["options"] = {{"temperature", 0.0}};  // 低温 → 更稳定
-    body["keep_alive"] = -1;  // keep model loaded
-
-    // 3. 发送请求
-    std::string response;
-    try {
-        response = http_post(body.dump());
-    } catch (const std::exception& e) {
-        std::cerr << "   [FunctionCaller] HTTP 错误: " << e.what() << std::endl;
+    if (!backend_ || !backend_->IsAvailable()) {
+        std::cerr << "   [FunctionCaller] LLM backend not available" << std::endl;
         return {false, "", {}};
     }
 
-    // 4. 解析响应
-    try {
-        json resp = json::parse(response);
-        std::string content = resp.value("message", json::object())
-                                   .value("content", "");
+    // 1. 构建 system prompt + user message
+    std::string system_prompt = build_system_prompt(tools);
+    std::string user_prompt   = build_user_message(user_message);
 
+    // 2. 通过 LLMBackend 发送 Chat 请求
+    //    (无对话历史，无 skill context，无取消)
+    std::string content;
+    try {
+        content = backend_->Chat(system_prompt, user_prompt,
+                                  {} /* no history */,
+                                  "" /* no skill context */,
+                                  nullptr /* no cancel */);
+    } catch (const std::exception& e) {
+        std::cerr << "   [FunctionCaller] LLM 调用异常: " << e.what() << std::endl;
+        return {false, "", {}};
+    }
+
+    if (content.empty()) {
+        std::cerr << "   [FunctionCaller] LLM 返回空响应" << std::endl;
+        return {false, "", {}};
+    }
+
+    // 3. 解析响应（与旧实现相同逻辑）
+    try {
         // LLM 输出可能包含 markdown 代码块，先清洗
         // 尝试提取 JSON 部分
         std::string json_str;
@@ -175,39 +150,4 @@ std::string FunctionCaller::build_system_prompt(
 std::string FunctionCaller::build_user_message(const std::string& user_input)
 {
     return "用户说: \"" + user_input + "\"\n\n请判断需要调用哪个工具，并输出 JSON。";
-}
-
-// ── HTTP POST ─────────────────────────────────────────
-
-std::string FunctionCaller::http_post(const std::string& request_json) const
-{
-    std::string url = host_ + "/api/chat";
-    std::string response;
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        throw std::runtime_error("curl_easy_init 失败");
-    }
-
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_json.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)request_json.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec_);
-
-    CURLcode res = curl_easy_perform(curl);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
-        throw std::runtime_error(std::string("curl 错误: ") + curl_easy_strerror(res));
-    }
-
-    return response;
 }

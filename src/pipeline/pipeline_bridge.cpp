@@ -125,33 +125,6 @@ bool PipelineBridge::WriteWavFile(const std::string& path,
 }
 
 // ---------------------------------------------------------------------------
-// libcurl helper
-// ---------------------------------------------------------------------------
-
-namespace {
-
-size_t CurlWriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
-  size_t total = size * nmemb;
-  userp->append(static_cast<char*>(contents), total);
-  return total;
-}
-
-// CURL progress callback — checks cancellation flag and aborts transfer.
-// Returns non-zero to abort. Signature: int(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
-int CurlProgressCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
-                         curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
-  if (clientp) {
-    auto* cancel = static_cast<std::atomic<bool>*>(clientp);
-    if (cancel->load()) {
-      return 1;  // non-zero aborts the transfer
-    }
-  }
-  return 0;
-}
-
-} // namespace
-
-// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -252,13 +225,48 @@ bool PipelineBridge::Initialize() {
     system(cmd.str().c_str());
   }
 
+  // ── Initialize LLM backend (dual-backend: Ollama / TensorRT) ──
+  {
+    // Populate backend config from PipelineBridgeConfig
+    cfg_.llm_backend_cfg.model = cfg_.llm_model;
+    cfg_.llm_backend_cfg.timeout_sec = cfg_.llm_timeout_sec;
+    cfg_.llm_backend_cfg.ollama_host = cfg_.llm_host;
+
+    llm_backend_ = CreateLlmBackend(cfg_.llm_backend_cfg);
+
+    if (!llm_backend_ || !llm_backend_->IsAvailable()) {
+      LOG_ERROR("[Pipeline] LLM backend failed to initialize — "
+                "pipeline will not generate responses");
+      ready_.store(false);
+      return false;
+    }
+
+    LOG_INFO("[Pipeline] LLM backend: type={} model={}",
+             (llm_backend_->GetType() == LlmBackendType::kOllama ? "Ollama" : "TensorRT"),
+             llm_backend_->GetModelName());
+  }
+
   // --- Set up Function Calling ---
   if (cfg_.skills_enabled && cfg_.function_calling_enabled) {
     std::string fc_model = cfg_.fc_model.empty() ? cfg_.llm_model : cfg_.fc_model;
-    function_caller_ = std::make_shared<FunctionCaller>(cfg_.llm_host, fc_model);
-    skill_mgr_.set_function_caller(function_caller_);
-    skill_mgr_.set_function_calling_enabled(true);
-    LOG_INFO("[Pipeline] function calling enabled (model={})", fc_model);
+
+    // Create a dedicated backend for function calling (potentially different model)
+    auto fc_backend_cfg = cfg_.llm_backend_cfg;
+    fc_backend_cfg.model = fc_model;
+    auto fc_backend = CreateLlmBackend(fc_backend_cfg);
+
+    if (fc_backend && fc_backend->IsAvailable()) {
+      function_caller_ = std::make_shared<FunctionCaller>(fc_backend);
+      skill_mgr_.set_function_caller(function_caller_);
+      skill_mgr_.set_function_calling_enabled(true);
+      LOG_INFO("[Pipeline] function calling enabled (model={})", fc_model);
+    } else {
+      // Fall back: use the main LLM backend for function calling
+      LOG_WARN("[Pipeline] dedicated FC backend unavailable, using main LLM backend");
+      function_caller_ = std::make_shared<FunctionCaller>(llm_backend_);
+      skill_mgr_.set_function_caller(function_caller_);
+      skill_mgr_.set_function_calling_enabled(true);
+    }
   } else {
     skill_mgr_.set_function_calling_enabled(false);
     LOG_INFO("[Pipeline] function calling disabled");
@@ -275,12 +283,12 @@ bool PipelineBridge::Initialize() {
 #ifdef HAS_VOICE_PIPELINE
   LOG_INFO("[Pipeline] full voice pipeline mode");
 #else
-  LOG_INFO("[Pipeline] stub mode (LLM + Skills via Ollama HTTP API)");
+  LOG_INFO("[Pipeline] stub mode (LLM via backend abstraction)");
 #endif
 
   // Test LLM connectivity & warm up model (preload into GPU memory)
   {
-    std::string test_result = CallLlm("ping");
+    std::string test_result = llm_backend_->Ping();
     if (test_result.empty() || test_result.find("error") != std::string::npos) {
       LOG_WARN("[Pipeline] LLM connectivity test failed: {}", test_result);
     } else {
@@ -290,7 +298,7 @@ bool PipelineBridge::Initialize() {
     // Warm-up: send a tiny inference to load model into GPU memory.
     // Without this, the first real query pays a 1.6s+ cold-start penalty.
     auto t_warm = std::chrono::steady_clock::now();
-    std::string warm_result = CallLlm("hi");
+    std::string warm_result = llm_backend_->Generate("hi");
     auto t_warm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t_warm).count();
     LOG_INFO("[Pipeline] model warm-up complete ({}ms)", t_warm_ms);
@@ -483,7 +491,7 @@ PipelineResult PipelineBridge::ProcessText(const std::string& text,
       result.error = "cancelled before LLM";
       return result;
     }
-    result.llm_response = CallLlmChat(system_prompt, text, history_msgs, skill_context, cancel);
+    result.llm_response = llm_backend_->Chat(system_prompt, text, history_msgs, skill_context, cancel);
 
     // Check if LLM was cancelled
     if (cancel && cancel->load()) {
@@ -732,8 +740,8 @@ PipelineResult PipelineBridge::ProcessTextStream(
     return result;
   }
 
-  result.llm_response = CallLlmChatStream(system_prompt, text, history_msgs,
-                                          skill_context, on_llm_token, cancel);
+  result.llm_response = llm_backend_->ChatStream(system_prompt, text, history_msgs,
+                                                  skill_context, on_llm_token, cancel);
 
   auto t_llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t_llm_start).count();
@@ -1445,352 +1453,6 @@ bool PipelineBridge::SynthesizeTtsStream(const std::string& text,
             text, total_samples,
             total_samples * 1000 / 22050);
   return total_samples > 0;
-}
-
-// ---------------------------------------------------------------------------
-// LLM Call (Ollama /api/generate — used for ping and simple prompts)
-// ---------------------------------------------------------------------------
-
-std::string PipelineBridge::CallLlm(const std::string& prompt,
-                                    const std::string& context,
-                                    std::atomic<bool>* cancel) {
-  if (prompt == "ping") {
-    // Just check connectivity
-    CURL* curl = curl_easy_init();
-    if (!curl) return "error: curl_init failed";
-
-    std::string url = cfg_.llm_host + "/api/tags";
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-
-    std::string response;
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    CURLcode res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-
-    if (res == CURLE_OK) return "ok";
-    return "error: " + std::string(curl_easy_strerror(res));
-  }
-
-  // Check cancellation before starting
-  if (cancel && cancel->load()) return "";
-
-  // Actual LLM inference
-  CURL* curl = curl_easy_init();
-  if (!curl) return "";
-
-  std::string url = cfg_.llm_host + "/api/generate";
-
-  json body;
-  body["model"] = cfg_.llm_model;
-  body["prompt"] = prompt;
-  body["stream"] = false;
-  body["options"]["temperature"] = 0.7;
-  body["options"]["num_predict"] = 128;  // ~50 Chinese chars, 128 tokens is plenty
-  body["keep_alive"] = -1;  // keep model loaded in Ollama memory
-
-  std::string body_str = body.dump();
-
-  struct curl_slist* headers = nullptr;
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
-
-  // Enable cancellation via progress callback
-  if (cancel) {
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  }
-
-  std::string response;
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-  CURLcode res = curl_easy_perform(curl);
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (res != CURLE_OK) {
-    if (res == CURLE_ABORTED_BY_CALLBACK) {
-      LOG_INFO("[LLM] request cancelled by interrupt");
-    } else {
-      LOG_ERROR("[LLM] curl error: {}", curl_easy_strerror(res));
-    }
-    return "";
-  }
-
-  // Parse Ollama response
-  try {
-    auto j = json::parse(response);
-    std::string reply = j.value("response", "");
-    // Trim whitespace
-    auto start = reply.find_first_not_of(" \t\n\r");
-    auto end = reply.find_last_not_of(" \t\n\r");
-    if (start != std::string::npos) {
-      reply = reply.substr(start, end - start + 1);
-    }
-    return reply;
-  } catch (const json::exception& e) {
-    LOG_ERROR("[LLM] JSON parse error: {}", e.what());
-    return "";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// LLM Call via /api/chat (supports conversation history as messages)
-// ---------------------------------------------------------------------------
-
-std::string PipelineBridge::CallLlmChat(const std::string& system_prompt,
-                                         const std::string& user_text,
-                                         const std::vector<ChatMessage>& history_msgs,
-                                         const std::string& skill_context,
-                                         std::atomic<bool>* cancel) {
-  // Check cancellation before starting
-  if (cancel && cancel->load()) return "";
-
-  CURL* curl = curl_easy_init();
-  if (!curl) return "";
-
-  std::string url = cfg_.llm_host + "/api/chat";
-
-  // Build messages array
-  json messages = json::array();
-
-  // System message with personality
-  messages.push_back({
-      {"role", "system"},
-      {"content", system_prompt}
-  });
-
-  // Skill context (tool result injected for LLM to use)
-  if (!skill_context.empty()) {
-    messages.push_back({
-        {"role", "system"},
-        {"content", "[工具返回结果]\n" + skill_context + "\n\n请严格根据以上工具返回的事实信息回答用户问题，不要凭训练数据猜测。"}
-    });
-  }
-
-  // History messages — proper user/assistant alternating with embedded skill facts
-  for (const auto& msg : history_msgs) {
-    messages.push_back({
-        {"role", msg.role},
-        {"content", msg.content}
-    });
-  }
-
-  // Current user message
-  messages.push_back({
-      {"role", "user"},
-      {"content", user_text}
-  });
-
-  json body;
-  body["model"] = cfg_.llm_model;
-  body["messages"] = messages;
-  body["stream"] = false;
-  body["options"]["temperature"] = 0.7;
-  body["options"]["num_predict"] = 128;  // ~50 Chinese chars, 128 tokens is plenty
-  body["keep_alive"] = -1;  // keep model loaded in Ollama memory
-
-  std::string body_str = body.dump();
-
-  struct curl_slist* headers = nullptr;
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
-
-  // Enable cancellation via progress callback
-  if (cancel) {
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  }
-
-  std::string response;
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-  CURLcode res = curl_easy_perform(curl);
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (res != CURLE_OK) {
-    if (res == CURLE_ABORTED_BY_CALLBACK) {
-      LOG_INFO("[LLM] chat request cancelled by interrupt");
-    } else {
-      LOG_ERROR("[LLM] curl error: {}", curl_easy_strerror(res));
-    }
-    return "";
-  }
-
-  // Parse Ollama /api/chat response
-  try {
-    auto j = json::parse(response);
-    std::string reply = j.value("message", json::object()).value("content", "");
-    // Trim whitespace
-    auto start = reply.find_first_not_of(" \t\n\r");
-    auto end = reply.find_last_not_of(" \t\n\r");
-    if (start != std::string::npos) {
-      reply = reply.substr(start, end - start + 1);
-    }
-    return reply;
-  } catch (const json::exception& e) {
-    LOG_ERROR("[LLM] JSON parse error: {}", e.what());
-    return "";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// LLM Call via /api/chat (streaming — NDJSON chunks)
-// ---------------------------------------------------------------------------
-
-namespace {
-// State for streaming curl write callback — accumulates partial NDJSON lines
-struct LlmStreamState {
-  LlmTokenCallback on_token;
-  std::atomic<bool>* cancel;
-  std::string full_response;  // accumulated complete text
-  std::string buffer;         // partial line buffer
-};
-}  // namespace
-
-static size_t LlmStreamWriteCallback(void* contents, size_t size, size_t nmemb,
-                                      void* userp) {
-  auto* state = static_cast<LlmStreamState*>(userp);
-  size_t total = size * nmemb;
-
-  // Check cancellation
-  if (state->cancel && state->cancel->load()) return 0;
-
-  state->buffer.append(static_cast<char*>(contents), total);
-
-  // Process complete lines
-  size_t pos;
-  while ((pos = state->buffer.find('\n')) != std::string::npos) {
-    std::string line = state->buffer.substr(0, pos);
-    state->buffer.erase(0, pos + 1);
-
-    // Trim \r
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.empty()) continue;
-
-    try {
-      auto j = nlohmann::json::parse(line);
-      bool done = j.value("done", false);
-
-      if (!done) {
-        std::string token = j.value("message", nlohmann::json::object())
-                                .value("content", "");
-        if (!token.empty()) {
-          state->full_response += token;
-          if (state->on_token) state->on_token(token, false);
-        }
-      } else {
-        if (state->on_token) state->on_token("", true);
-      }
-    } catch (const nlohmann::json::exception& e) {
-      LOG_DEBUG("[LLM] stream parse error: {} — line: {}", e.what(), line);
-    }
-  }
-
-  return total;
-}
-
-std::string PipelineBridge::CallLlmChatStream(
-    const std::string& system_prompt,
-    const std::string& user_text,
-    const std::vector<ChatMessage>& history_msgs,
-    const std::string& skill_context,
-    LlmTokenCallback on_token,
-    std::atomic<bool>* cancel) {
-
-  if (cancel && cancel->load()) return "";
-
-  CURL* curl = curl_easy_init();
-  if (!curl) return "";
-
-  std::string url = cfg_.llm_host + "/api/chat";
-
-  // Build messages array (same as CallLlmChat)
-  nlohmann::json messages = nlohmann::json::array();
-  messages.push_back({{"role", "system"}, {"content", system_prompt}});
-
-  if (!skill_context.empty()) {
-    messages.push_back({
-        {"role", "system"},
-        {"content", "[工具返回结果]\n" + skill_context +
-                    "\n\n请严格根据以上工具返回的事实信息回答用户问题，不要凭训练数据猜测。"}
-    });
-  }
-
-  for (const auto& msg : history_msgs) {
-    messages.push_back({{"role", msg.role}, {"content", msg.content}});
-  }
-  messages.push_back({{"role", "user"}, {"content", user_text}});
-
-  nlohmann::json body;
-  body["model"] = cfg_.llm_model;
-  body["messages"] = messages;
-  body["stream"] = true;                       // ← streaming!
-  body["options"]["temperature"] = 0.7;
-  body["options"]["num_predict"] = 128;
-  body["keep_alive"] = -1;
-
-  std::string body_str = body.dump();
-
-  struct curl_slist* headers = nullptr;
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(cfg_.llm_timeout_sec));
-
-  // Set up streaming state
-  LlmStreamState state;
-  state.on_token = std::move(on_token);
-  state.cancel = cancel;
-
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, LlmStreamWriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
-
-  // Enable cancellation via progress callback
-  if (cancel) {
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  }
-
-  CURLcode res = curl_easy_perform(curl);
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (res != CURLE_OK) {
-    if (res == CURLE_ABORTED_BY_CALLBACK) {
-      LOG_INFO("[LLM] stream request cancelled by interrupt");
-    } else {
-      LOG_ERROR("[LLM] stream curl error: {}", curl_easy_strerror(res));
-    }
-    return "";
-  }
-
-  // Trim response
-  auto start = state.full_response.find_first_not_of(" \t\n\r");
-  auto end = state.full_response.find_last_not_of(" \t\n\r");
-  if (start != std::string::npos) {
-    state.full_response = state.full_response.substr(start, end - start + 1);
-  }
-
-  return state.full_response;
 }
 
 // ---------------------------------------------------------------------------

@@ -179,6 +179,22 @@ static bool LoadConfig(const std::string& path, ServerConfig& cfg) {
       cfg.pipeline.llm_system_prompt = l.value("system_prompt", cfg.pipeline.llm_system_prompt);
       cfg.pipeline.llm_timeout_sec = l.value("timeout_sec", cfg.pipeline.llm_timeout_sec);
       cfg.pipeline.llm_streaming = l.value("streaming", cfg.pipeline.llm_streaming);
+
+      // LLM backend type: "ollama" (default) or "tensorrt"
+      std::string backend_type = l.value("backend", "tensorrt");
+      if (backend_type == "tensorrt") {
+        cfg.pipeline.llm_backend_cfg.type = LlmBackendType::kTensorRT;
+        cfg.pipeline.llm_backend_cfg.trt_engine_path =
+            l.value("tensorrt_engine_path", "");
+        cfg.pipeline.llm_backend_cfg.trt_tokenizer_path =
+            l.value("tensorrt_tokenizer_path", "");
+        LOG_INFO("Config: LLM backend = TensorRT (engine={}, tokenizer={})",
+                 cfg.pipeline.llm_backend_cfg.trt_engine_path,
+                 cfg.pipeline.llm_backend_cfg.trt_tokenizer_path);
+      } else {
+        cfg.pipeline.llm_backend_cfg.type = LlmBackendType::kOllama;
+        LOG_INFO("Config: LLM backend = Ollama (host={})", cfg.pipeline.llm_host);
+      }
     }
 
     // TTS section
@@ -1226,7 +1242,10 @@ int main(int argc, char* argv[]) {
            cfg.ws_bind, cfg.ws_port, cfg.ws_path);
   LOG_INFO("  RTSP:      {} (MediaMTX: {})",
            cfg.rtsp_base_url, cfg.auto_launch_mediamtx ? "managed" : "external");
-  LOG_INFO("  LLM:       {} ({})", cfg.pipeline.llm_host, cfg.pipeline.llm_model);
+  LOG_INFO("  LLM:       {} (backend={}, model={})",
+           cfg.pipeline.llm_host,
+           (cfg.pipeline.llm_backend_cfg.type == LlmBackendType::kOllama ? "Ollama" : "TensorRT"),
+           cfg.pipeline.llm_model);
   LOG_INFO("  Sessions:  max {}", cfg.max_sessions);
   LOG_INFO("==============================================================");
   LOG_INFO("  Waiting for robot connections...");

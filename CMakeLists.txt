@@ -36,6 +36,9 @@ set(SERVER_SOURCES
     src/memory/user_memory.cpp
     src/memory/token_counter.cpp
     src/llm/function_caller.cpp
+    src/llm/llm_backend.cpp
+    src/llm/ollama_backend.cpp
+    src/llm/tensorrt_backend.cpp
 )
 
 set(SERVER_HEADERS
@@ -65,6 +68,9 @@ set(SERVER_HEADERS
     src/memory/vector_store.h
     src/memory/token_counter.h
     src/llm/function_caller.h
+    src/llm/llm_backend.h
+    src/llm/ollama_backend.h
+    src/llm/tensorrt_backend.h
 )
 
 # --- Executable ---
@@ -103,6 +109,29 @@ if(ESPEAK_NG_LIB)
 else()
     set(ESPEAK_NG_LIB "")
     message(STATUS "espeak-ng not found — falling back to system() for TTS")
+endif()
+
+# TensorRT-LLM (NVIDIA GPU LLM inference for Jetson Orin)
+# Compile with -DTENSORRT_LLM_ROOT=/path/to/TensorRT-LLM to enable
+set(TENSORRT_LLM_ROOT "" CACHE PATH "Path to TensorRT-LLM installation")
+if(TENSORRT_LLM_ROOT)
+    set(TENSORRT_LLM_INCLUDE_DIR "${TENSORRT_LLM_ROOT}/cpp/include")
+    set(TENSORRT_LLM_LIB_DIR "${TENSORRT_LLM_ROOT}/cpp/build/tensorrt_llm")
+    if(EXISTS "${TENSORRT_LLM_INCLUDE_DIR}/tensorrt_llm/executor/executor.h")
+        target_include_directories(rtsp-mtx-server PRIVATE "${TENSORRT_LLM_INCLUDE_DIR}")
+        target_link_directories(rtsp-mtx-server PRIVATE "${TENSORRT_LLM_LIB_DIR}")
+        target_compile_definitions(rtsp-mtx-server PRIVATE TENSORRT_LLM_AVAILABLE=1)
+        target_link_libraries(rtsp-mtx-server PRIVATE
+            tensorrt_llm
+            tensorrt_llm_executor
+            tensorrt_llm_plugins
+        )
+        message(STATUS "TensorRT-LLM found — enabling GPU LLM inference")
+    else()
+        message(WARNING "TensorRT-LLM root specified but headers not found at ${TENSORRT_LLM_INCLUDE_DIR}")
+    endif()
+else()
+    message(STATUS "TensorRT-LLM not configured — TensorRT backend will be stub (Ollama fallback)")
 endif()
 
 # Conditionally link sherpa-onnx

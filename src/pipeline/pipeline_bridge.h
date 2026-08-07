@@ -28,6 +28,8 @@
 #include <curl/curl.h>
 
 #include "brain/skill_manager.h"
+#include "llm/llm_backend.h"
+#include "llm/function_caller.h"
 #include "memory/chat_memory.h"
 #include "memory/user_memory.h"
 
@@ -85,10 +87,13 @@ struct PipelineBridgeConfig {
   int memory_max_rounds = 10;
   int memory_max_tokens = 1536;
   std::string memory_persist_dir = "/tmp/rtsp-server/memory";
+
+  // LLM backend config (dual-backend support)
+  LlmBackendConfig llm_backend_cfg;
 };
 
 // --- Streaming callbacks ---
-using LlmTokenCallback = std::function<void(const std::string& token, bool is_final)>;
+// LlmTokenCallback is imported from llm_backend.h
 using TtsAudioCallback = std::function<void(const int16_t* pcm, int sample_count, bool is_final)>;
 
 // --- Processing result ---
@@ -221,6 +226,9 @@ private:
   PipelineBridgeConfig cfg_;
   std::atomic<bool> ready_{false};
 
+  // LLM backend (Ollama / TensorRT / ...)
+  std::shared_ptr<LLMBackend> llm_backend_;
+
   // Skills & memory
   SkillManager skill_mgr_;
   std::shared_ptr<FunctionCaller> function_caller_;
@@ -228,23 +236,6 @@ private:
   std::map<std::string, UserMemoryStore> user_memories_;  // per-user
   std::map<std::string, std::string> session_user_map_;   // session_id → user_id
   std::map<std::string, ChatMemory> session_memories_;    // per-session
-
-  // In stub mode, we use curl to call Ollama directly
-  std::string CallLlm(const std::string& prompt,
-                      const std::string& context = "",
-                      std::atomic<bool>* cancel = nullptr);
-  std::string CallLlmChat(const std::string& system_prompt,
-                          const std::string& user_text,
-                          const std::vector<ChatMessage>& history_msgs,
-                          const std::string& skill_context = "",
-                          std::atomic<bool>* cancel = nullptr);
-
-  std::string CallLlmChatStream(const std::string& system_prompt,
-                                const std::string& user_text,
-                                const std::vector<ChatMessage>& history_msgs,
-                                const std::string& skill_context,
-                                LlmTokenCallback on_token,
-                                std::atomic<bool>* cancel = nullptr);
 
   std::string EscapeJson(const std::string& s);
 

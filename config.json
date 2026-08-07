@@ -24,21 +24,19 @@
     "sample_rate": 16000
   },
   "llm": {
-    "host": "http://192.168.2.107:11434",
+    "host": "http://192.168.10.54:11434",
     "model": "qwen2.5:3b",
-    "system_prompt": "你是小希，一个活泼开朗的少女，说话可爱俏皮。你只会说中文，必须始终用中文回复，禁止使用英文。回复控制在三句话以内。不要复读用户原话，直接回应问题本身。",
+    "system_prompt": "你是小希，一个活泼开朗的少女，说话可爱俏皮。回复控制在三句话以内。不要复读用户原话，直接回应问题本身。",
     "timeout_sec": 60,
-    "max_response_tokens": 256,
-    "streaming": true
+    "max_response_tokens": 256
   },
   "tts": {
     "backend": "edge_tts",
-    "streaming": false,
     "rate": 200,
     "voice": "cmn+f3",
     "piper_model": "/home/lixin/pretrained_models/piper/zh_CN/zh_CN-huayan-medium.onnx",
     "edge_tts_script": "/home/lixin/eir/lixin/RTSP-MTX-SERVER/scripts/edge_tts_cli.py",
-    "edge_tts_voice": "zh-CN-XiaoyiNeural",
+    "edge_tts_voice": "zh-CN-XiaoxiaoNeural",
     "output_sample_rate": 16000,
     "cache_tts": true,
     "cache_dir": "/dev/shm/rtsp-server/tts-cache"

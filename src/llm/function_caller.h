@@ -16,13 +16,15 @@
  *   - 需要模型有一定的指令遵循能力（qwen2.5:1.5b+ 即可）
  *   - 0.5b 模型可能输出格式不稳定，SkillManager 会自动降级到关键字匹配
  *   - 每次工具选择都是一次独立的 LLM 调用（增加 ~1s 延迟）
+ *   - 使用 LLMBackend 抽象接口，兼容 Ollama / TensorRT 等多种后端
  */
 
+#include <memory>
 #include <string>
 #include <vector>
-#include <memory>
 
 #include "brain/skill_base.h"  // FunctionDef
+#include "llm/llm_backend.h"
 
 // ── 工具选择结果 ──────────────────────────────────────
 
@@ -36,10 +38,10 @@ struct ToolDecision {
 
 class FunctionCaller {
 public:
-    /// @param ollama_host  Ollama 服务地址 (如 http://127.0.0.1:11434)
-    /// @param model        用于工具选择的模型（可与主 LLM 不同）
-    FunctionCaller(const std::string& ollama_host,
-                   const std::string& model = "qwen2.5:0.5b");
+    /// @param backend  LLM backend instance (Ollama / TensorRT / ...).
+    ///                 The caller chooses the model (fc_model) and creates
+    ///                 the appropriate backend before passing it here.
+    explicit FunctionCaller(std::shared_ptr<rtsp_server::LLMBackend> backend);
 
     /// 让 LLM 决定调用哪个工具
     /// @param user_message  用户输入的原始文本
@@ -49,9 +51,7 @@ public:
                         const std::vector<FunctionDef>& tools);
 
 private:
-    std::string host_;
-    std::string model_;
-    long        timeout_sec_ = 30;
+    std::shared_ptr<rtsp_server::LLMBackend> backend_;
 
     /// 构建 function calling 的 system prompt
     static std::string build_system_prompt(
@@ -59,7 +59,4 @@ private:
 
     /// 构建用户消息（告诉 LLM 要做什么）
     static std::string build_user_message(const std::string& user_input);
-
-    /// HTTP POST 到 Ollama /api/chat
-    std::string http_post(const std::string& request_json) const;
 };
