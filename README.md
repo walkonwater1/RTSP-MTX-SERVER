@@ -25,8 +25,8 @@
 │  ┌─ Voice Pipeline ───────────────────────────────────────────────┐ │
 │  │  ASR (Zipformer CTC) → Skills → LLM (TensorRT/Ollama) → TTS   │ │
 │  │  ┌─ LLM Backend (双后端抽象层) ────────────────────────────┐  │ │
-│  │  │  TensorRT-LLM (Orin NX GPU):    qwen2.5:3b, ~500ms     │  │ │
-│  │  │  Ollama (fallback, 远程 CPU):   qwen2.5:3b, ~2-4s      │  │ │
+│  │  │  TensorRT-LLM (Orin NX GPU):    Qwen3-4B, ~500ms       │  │ │
+│  │  │  Ollama (fallback, 远程 CPU):   Qwen3-4B, ~2-4s        │  │ │
 │  │  │  自动降级: TensorRT 不可用时 → Ollama                   │  │ │
 │  │  └────────────────────────────────────────────────────────┘  │ │
 │  │  ┌─ Skill System ────────────────────────────────────────────┐ │ │
@@ -47,14 +47,14 @@
 
 ## 延迟与性能
 
-### 甜点配置：TensorRT + qwen2.5:3b
+### 甜点配置：TensorRT + Qwen3-4B
 
 在当前硬件 (NVIDIA Jetson Orin NX) 上的最佳实践：
 
 ```
                     ┌────────── 端到端延迟 ≤1s（目标）──────────┐
                     │                                           │
-  [ASR] ~100ms  →  [LLM TensorRT 3b] ~500ms  →  [TTS 本地] ~200ms
+  [ASR] ~100ms  →  [LLM TensorRT Qwen3-4B] ~500ms  →  [TTS 本地] ~200ms
                     │                                           │
                     └── 当前 TTS 用 Edge 云服务 ~1-3s ──────────┘
 ```
@@ -62,8 +62,8 @@
 | 阶段 | 甜点方案 | 延迟 | 说明 |
 |------|---------|------|------|
 | **ASR** | Zipformer CTC (sherpa-onnx, 直接 C API) | ~100ms | CPU 推理，4 线程 |
-| **LLM** | **TensorRT-LLM + qwen2.5:3b** (Orin NX GPU) | **~500ms** | 当前最佳性价比，W4A16 量化 |
-| **LLM** (fallback) | Ollama + qwen2.5:3b (远程 192.168.10.54) | ~2-4s | 网络往返 + CPU 推理 |
+| **LLM** | **TensorRT-LLM + Qwen3-4B** (Orin NX GPU) | **~500ms** | 当前最佳性价比，W4A16 量化 |
+| **LLM** (fallback) | Ollama + Qwen3-4B (远程 192.168.2.107) | ~2-4s | 网络往返 + CPU 推理 |
 | **TTS** (当前) | Edge-TTS (zh-CN-XiaoxiaoNeural, 微软云) | **~1-3s** | 音质好但延迟高，受网络波动影响 |
 | **TTS** (计划) | ChatTTS / Piper 本地部署 | **~200ms** | 目标：总延迟控制在 1s 内 |
 
@@ -77,7 +77,7 @@ enum class LlmBackendType { kOllama, kTensorRT };
 auto backend = CreateLlmBackend(cfg);  // 自动选择可用后端
 ```
 
-- **TensorRT-LLM** (`src/llm/tensorrt_backend.cpp`): 在 Orin NX 上编译后启用，`qwen2.5:3b` W4A16 量化 ~500ms/回复
+- **TensorRT-LLM** (`src/llm/tensorrt_backend.cpp`): 在 Orin NX 上编译后启用，`qwen3:4b-w4a16` W4A16 量化 ~500ms/回复
 - **Ollama** (`src/llm/ollama_backend.cpp`): 远程 HTTP API，自动 fallback，支持流式 (`ChatStream`)
 - 配置中设置 `llm.backend = "tensorrt"` 即可优先使用 TensorRT，不可用时自动降级
 
@@ -140,7 +140,7 @@ sudo cp mediamtx /usr/local/bin/
 # 编译时启用 -DTENSORRT_LLM_AVAILABLE=ON
 ## 方案B: 远程 Ollama（fallback）
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen2.5:3b
+ollama pull qwen3:4b
 
 # TTS 运行时
 ## 当前: Edge-TTS (微软云)
@@ -216,8 +216,8 @@ cmake --build . -j$(nproc)
     "sample_rate": 16000
   },
   "llm": {
-    "host": "http://192.168.10.54:11434",
-    "model": "qwen2.5:3b",
+    "host": "http://192.168.2.107:11434",
+    "model": "qwen3:4b-w4a16",
     "system_prompt": "你是小希，一个活泼开朗的少女，说话可爱俏皮。回复控制在三句话以内。不要复读用户原话，直接回应问题本身。",
     "timeout_sec": 60,
     "max_response_tokens": 256
@@ -487,7 +487,7 @@ Pipeline 处理用户输入时分两条路径：
 ```
 端到端延迟分解（当前）:
   ASR       ~100ms  ✅
-  LLM       ~500ms  ✅ (TensorRT + qwen2.5:3b on Orin NX)
+  LLM       ~500ms  ✅ (TensorRT + Qwen3-4B on Orin NX)
   TTS       ~1-3s   ❌ (Edge-TTS 微软云，网络延迟不可控)
   ─────────────────
   总计      ~1.6-3.6s
