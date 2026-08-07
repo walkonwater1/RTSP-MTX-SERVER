@@ -23,7 +23,12 @@
 │  └────────────────────────────────────────────────────────────────┘ │
 │                                                                      │
 │  ┌─ Voice Pipeline ───────────────────────────────────────────────┐ │
-│  │  ASR (Zipformer CTC) → Skills/FC → LLM (Ollama) → TTS (Piper) │ │
+│  │  ASR (Zipformer CTC) → Skills → LLM (TensorRT/Ollama) → TTS   │ │
+│  │  ┌─ LLM Backend (双后端抽象层) ────────────────────────────┐  │ │
+│  │  │  TensorRT-LLM (Orin NX GPU):    qwen2.5:3b, ~500ms     │  │ │
+│  │  │  Ollama (fallback, 远程 CPU):   qwen2.5:3b, ~2-4s      │  │ │
+│  │  │  自动降级: TensorRT 不可用时 → Ollama                   │  │ │
+│  │  └────────────────────────────────────────────────────────┘  │ │
 │  │  ┌─ Skill System ────────────────────────────────────────────┐ │ │
 │  │  │  9 个技能: 时间/天气/计算器/娱乐/谜语/运势/诗词/游戏/记忆  │ │ │
 │  │  │  双策略: Function Calling (LLM驱动) + Keyword Match (兜底) │ │ │
@@ -35,10 +40,60 @@
 │  └────────────────────────────────────────────────────────────────┘ │
 │                                                                      │
 │  ┌─ Session Manager ──────────────────────────────────────────────┐ │
-│  │  每机器人一个 Session: 状态机 + TTS 队列 + ASR 累积            │ │
+│  │  每机器人一个 Session: 状态机 + TTS 队列 + ASR 累积 + 打断     │ │
 │  └────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+## 延迟与性能
+
+### 甜点配置：TensorRT + qwen2.5:3b
+
+在当前硬件 (NVIDIA Jetson Orin NX) 上的最佳实践：
+
+```
+                    ┌────────── 端到端延迟 ≤1s（目标）──────────┐
+                    │                                           │
+  [ASR] ~100ms  →  [LLM TensorRT 3b] ~500ms  →  [TTS 本地] ~200ms
+                    │                                           │
+                    └── 当前 TTS 用 Edge 云服务 ~1-3s ──────────┘
+```
+
+| 阶段 | 甜点方案 | 延迟 | 说明 |
+|------|---------|------|------|
+| **ASR** | Zipformer CTC (sherpa-onnx, 直接 C API) | ~100ms | CPU 推理，4 线程 |
+| **LLM** | **TensorRT-LLM + qwen2.5:3b** (Orin NX GPU) | **~500ms** | 当前最佳性价比，W4A16 量化 |
+| **LLM** (fallback) | Ollama + qwen2.5:3b (远程 192.168.10.54) | ~2-4s | 网络往返 + CPU 推理 |
+| **TTS** (当前) | Edge-TTS (zh-CN-XiaoxiaoNeural, 微软云) | **~1-3s** | 音质好但延迟高，受网络波动影响 |
+| **TTS** (计划) | ChatTTS / Piper 本地部署 | **~200ms** | 目标：总延迟控制在 1s 内 |
+
+### LLM 后端
+
+项目支持双后端架构，运行时自动选择：
+
+```cpp
+// llm_backend.h — 工厂模式
+enum class LlmBackendType { kOllama, kTensorRT };
+auto backend = CreateLlmBackend(cfg);  // 自动选择可用后端
+```
+
+- **TensorRT-LLM** (`src/llm/tensorrt_backend.cpp`): 在 Orin NX 上编译后启用，`qwen2.5:3b` W4A16 量化 ~500ms/回复
+- **Ollama** (`src/llm/ollama_backend.cpp`): 远程 HTTP API，自动 fallback，支持流式 (`ChatStream`)
+- 配置中设置 `llm.backend = "tensorrt"` 即可优先使用 TensorRT，不可用时自动降级
+
+### TTS 当前状态
+
+```
+当前:  Edge-TTS (zh-CN-XiaoxiaoNeural) → 微软云 TTS，音色温暖自然
+       延迟: 1-3s（网络 + 合成 + ffmpeg 转码）
+       瓶颈: 网络延迟不可控，是端到端延迟的主要来源
+
+计划:  ChatTTS (本地 GPU) / Piper (本地 CPU)
+       延迟: ~200ms
+       目标: ASR(100ms) + LLM(500ms) + TTS(200ms) ≈ 800ms 端到端
+```
+
+> ChatTTS CLI 已就绪（`scripts/chattts_cli.py`），待 Orin NX 上 GPU 推理调通后切换。
 
 ## 协议
 
@@ -73,25 +128,28 @@ TTS WAV → ffmpeg push → MediaMTX → RTSP pull → ffmpeg → 机器人 spea
 
 ```bash
 # 系统库
-sudo apt install libcurl4-openssl-dev libspdlog-dev nlohmann-json3-dev
+sudo apt install libcurl4-openssl-dev libspdlog-dev nlohmann-json3-dev ffmpeg
 
 # MediaMTX (RTSP 媒体服务器)
 wget https://github.com/bluenviron/mediamtx/releases/download/v1.8.0/mediamtx_v1.8.0_linux_amd64.tar.gz
 tar xzf mediamtx_v1.8.0_linux_amd64.tar.gz
 sudo cp mediamtx /usr/local/bin/
 
-# ffmpeg
-sudo apt install ffmpeg
-
-# Ollama (LLM)
+# LLM 运行时（二选一）
+## 方案A: TensorRT-LLM on Orin NX（甜点，~500ms）
+# 编译时启用 -DTENSORRT_LLM_AVAILABLE=ON
+## 方案B: 远程 Ollama（fallback）
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen2.5:3b
 
-# espeak-ng (TTS fallback)
-sudo apt install espeak-ng
+# TTS 运行时
+## 当前: Edge-TTS (微软云)
+pip install edge-tts
+## 计划: ChatTTS (本地 GPU TTS)
+pip install chattts
 
-# 可选: Piper TTS (更高质量)
-# pip install piper-tts
+# espeak-ng (TTS fallback, 最低延迟备选)
+sudo apt install espeak-ng
 ```
 
 ## 编译
@@ -138,39 +196,39 @@ cmake --build . -j$(nproc)
     "ws_port": 8090,
     "ws_path": "/ws/rtsp",
     "rtsp_port": 8554,
-    "rtsp_base_url": "rtsp://192.168.2.106:8554",
+    "rtsp_base_url": "rtsp://192.168.2.110:8554",
     "bind_address": "0.0.0.0",
     "max_sessions": 32,
     "heartbeat_interval_sec": 15,
     "session_timeout_sec": 300
   },
   "mediamtx": {
-    "binary_path": "/usr/local/bin/mediamtx",
+    "binary_path": "/home/lixin/.local/bin/mediamtx",
     "auto_launch": true,
     "rtmp_disable": true,
     "hls_disable": true,
-    "webrtc_disable": true
+    "webrtc_disable": true,
+    "srt_disable": true
   },
   "asr": {
-    "model_path": "/path/to/sherpa-onnx/zipformer-ctc-zh",
+    "model_path": "/eir/lixin/ASR-LLM-TTS/src/third_party/sherpa-onnx/zipformer-ctc-zh",
     "model_type": "zipformer_ctc",
     "sample_rate": 16000
   },
   "llm": {
-    "host": "http://localhost:11434",
+    "host": "http://192.168.10.54:11434",
     "model": "qwen2.5:3b",
-    "system_prompt": "你是小千，一个18岁女大学生...",
+    "system_prompt": "你是小希，一个活泼开朗的少女，说话可爱俏皮。回复控制在三句话以内。不要复读用户原话，直接回应问题本身。",
     "timeout_sec": 60,
     "max_response_tokens": 256
   },
   "tts": {
-    "backend": "piper",
-    "rate": 200,
-    "voice": "cmn+f3",
-    "piper_model": "/path/to/zh_CN-huayan-medium.onnx",
+    "backend": "edge_tts",
+    "edge_tts_script": "/home/lixin/eir/lixin/RTSP-MTX-SERVER/scripts/edge_tts_cli.py",
+    "edge_tts_voice": "zh-CN-XiaoxiaoNeural",
     "output_sample_rate": 16000,
     "cache_tts": true,
-    "cache_dir": "/tmp/rtsp-server/tts-cache"
+    "cache_dir": "/dev/shm/rtsp-server/tts-cache"
   },
   "vad": {
     "backend": "adaptive",
@@ -178,12 +236,15 @@ cmake --build . -j$(nproc)
     "min_speech_frames": 15,
     "min_silence_frames": 15,
     "pre_speech_frames": 15,
+    "adaptive_factor": 7.0,
+    "min_energy": 0.025,
+    "cooldown_frames": 25,
     "max_speech_sec": 60,
     "min_speech_sec": 0.5
   },
   "skills": {
     "enabled": true,
-    "function_calling_enabled": true,
+    "function_calling_enabled": false,
     "fc_model": ""
   },
   "memory": {
@@ -209,7 +270,11 @@ cmake --build . -j$(nproc)
 | | `rtsp_base_url` | **必须设为机器人可访问的 IP**（不能用 0.0.0.0 或 127.0.0.1） |
 | `mediamtx` | `auto_launch` | 是否自动启动 MediaMTX 进程 |
 | `llm` | `host`, `model` | Ollama 服务地址和模型名 |
+| | `backend` | LLM 后端类型：`"tensorrt"`（Orin NX GPU, ~500ms）或默认 Ollama |
 | | `system_prompt` | 系统人设 prompt，会自动附加当前时间上下文 |
+| `tts` | `backend` | TTS 后端：`"edge_tts"`（当前，微软云）/ `"piper"`（本地）/ `"chattts"`（计划中） |
+| | `edge_tts_voice` | Edge-TTS 音色：`zh-CN-XiaoxiaoNeural`（温暖） / `zh-CN-XiaoyiNeural`（明亮） / `zh-CN-YunxiNeural`（男声） |
+| | `cache_dir` | TTS 缓存目录（建议 `/dev/shm` 内存文件系统，重启后自动清空） |
 | `skills` | `function_calling_enabled` | 启用 LLM 驱动的工具选择（需要额外一次 FC LLM 调用） |
 | | `fc_model` | FC 专用模型，为空则复用 `llm.model` |
 | `memory` | `max_rounds` | 对话记忆保留轮数 |
@@ -217,7 +282,6 @@ cmake --build . -j$(nproc)
 | `audio` | `debug_dump_dir` | ASR/VAD 调试音频 dump 目录 |
 | `feishu` | `webhook_url` | 飞书机器人 Webhook 地址（connect/disconnect/ASR/Pipeline 事件推送） |
 | `vad` | `energy_threshold` | 语音活动检测能量阈值 |
-| `mediamtx` | `rtmp_disable` | 禁用 RTMP/HLS/WebRTC 协议（仅保留 RTSP） |
 
 **重要**: 将 `rtsp_base_url` 设为机器人可以访问的 IP 地址（不能用 `0.0.0.0` 或 `127.0.0.1`）。
 
@@ -247,7 +311,8 @@ rtsp-server/
 ├── README.md
 ├── scripts/
 │   ├── start_mediamtx.sh                # MediaMTX 启动脚本
-│   ├── edge_tts_cli.py                  # Edge TTS CLI (替代 Piper)
+│   ├── edge_tts_cli.py                  # Edge TTS CLI (微软云 TTS)
+│   ├── chattts_cli.py                   # ChatTTS CLI (本地 GPU TTS，计划中)
 │   ├── build_and_run.sh                 # 一键编译+运行
 │   ├── monitor.sh                       # 服务监控脚本
 │   └── rtsp-monitor.conf.example        # 监控配置模板
@@ -274,6 +339,9 @@ rtsp-server/
 │   │       ├── skill_games.h/cpp         # 小游戏 (猜数字/成语接龙)
 │   │       └── skill_memory.h/cpp        # 用户记忆 (偏好/事实存储)
 │   ├── llm/
+│   │   ├── llm_backend.h/cpp             # LLM 后端抽象接口（工厂模式）
+│   │   ├── ollama_backend.h/cpp          # Ollama HTTP 后端 (Chat + ChatStream)
+│   │   ├── tensorrt_backend.h/cpp        # TensorRT-LLM 后端 (Orin NX GPU)
 │   │   └── function_caller.h/cpp         # Function Calling: LLM 驱动工具选择
 │   ├── memory/
 │   │   ├── chat_memory.h/cpp             # 会话对话记忆 (多轮上下文)
@@ -411,6 +479,43 @@ Pipeline 处理用户输入时分两条路径：
 ```
 
 推送为独立线程执行，Webhook 不可达时不会阻塞主服务。
+
+## 路线图
+
+### 当前瓶颈：TTS 延迟
+
+```
+端到端延迟分解（当前）:
+  ASR       ~100ms  ✅
+  LLM       ~500ms  ✅ (TensorRT + qwen2.5:3b on Orin NX)
+  TTS       ~1-3s   ❌ (Edge-TTS 微软云，网络延迟不可控)
+  ─────────────────
+  总计      ~1.6-3.6s
+```
+
+### 计划：本地 TTS 模型
+
+```
+端到端延迟分解（目标）:
+  ASR       ~100ms  ✅
+  LLM       ~500ms  ✅
+  TTS       ~200ms  🎯 (ChatTTS / Piper 本地推理)
+  ─────────────────
+  总计      ~800ms  🎯
+```
+
+| 方案 | 模型 | 延迟 | 音质 | 状态 |
+|------|------|------|------|------|
+| **ChatTTS** | 本地 GPU (Orin NX) | ~200ms | ⭐⭐⭐ 自然流畅 | `scripts/chattts_cli.py` 已就绪，待 GPU 推理调通 |
+| Piper | 本地 CPU | ~300ms | ⭐⭐ 清晰可辨 | 已集成，音色偏机械 |
+| Edge-TTS | 微软云 | ~1-3s | ⭐⭐⭐ 温暖自然 | 当前使用 |
+
+ChatTTS 是 2.5 亿参数的神经 TTS 大模型，支持笑声/停顿等韵律控制，在 Orin NX GPU 上推理预计 ~200ms/句。切换后将实现 **≤1 秒端到端语音交互**。
+
+```bash
+# ChatTTS 测试（当前可手动验证音质）
+python3 scripts/chattts_cli.py --text "你好呀，今天天气真不错" --output /tmp/test.wav
+```
 
 ## 项目关联
 
